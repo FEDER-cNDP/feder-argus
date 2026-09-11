@@ -1,0 +1,1340 @@
+---
+name: d3d-elm-index
+description: "Query stored ELM (Edge Localized Mode) labels for DIII-D shots and the filterscope signal-availability metadata collected alongside them. Use for: when a shot was ELMy, individual ELM burst times, ELM frequency/period, finding shots by ELM behaviour, which detector produced a label and with what parameters, comparing two detection methods, and which filterscope channels a shot has at what sampling rate. This is DERIVED LABEL data, NOT the raw waveform -- for the D-alpha trace itself use d3d-filterscopes or d3d-shot-fetcher; for shot metadata (kappa, Ip, pulse length, signal catalog) use d3d-relational-db."
+license: Apache-2.0
+compatibility: Designed for deepagents CLI
+metadata:
+  author: DeepTok
+  version: "1.0"
+---
+
+# d3d-elm-index -- stored ELM labels and filterscope availability
+
+## What this is
+
+A served index of ELM labels produced by running detection code over
+DIII-D shots, plus a record of what filterscope data each shot actually had.
+
+Three kinds of stored fact, and anything derivable from them is in scope:
+
+1. **ELM labels** -- when a shot was ELMy (phases) and when individual ELMs
+   fired (bursts), in milliseconds.
+2. **Detector provenance** -- which method, version and parameters produced
+   each label, so results from different methods can be compared instead of
+   silently mixed.
+3. **Signal availability** -- which filterscope channels a shot has, at what
+   sampling rate, and the reason when a channel is missing.
+
+This is not a fixed list of supported questions. Compose the functions below,
+and use `query_elm_index(sql)` with `schema()` for anything they do not cover.
+
+## What this is NOT
+
+- **Not the raw waveform.** To fetch and plot a D-alpha trace, use
+  `d3d-filterscopes` or `d3d-shot-fetcher`.
+- **Not shot metadata.** For kappa, Ip, beam power, pulse length or the signal
+  catalog, use `d3d-relational-db`. To combine the two, see "Joining to
+  d3drdb" below.
+- **Not a live detector.** These are labels from a past run. Producing new
+  labels is a separate offline job.
+
+## No fdp wrapper needed
+
+Served over HTTP by the FEDER lakehouse -- no Pelican, no `fdp`, and nothing to
+download. Run scripts with plain `python script.py`. The command must be BARE
+`python script.py`, with no `cd ... &&`, no pipes and no redirection, so it runs
+in-kernel.
+
+It does need outbound network. If the service is unreachable the helper says so
+in those terms; there is no local copy to fall back to.
+
+## Importing
+
+```python
+import os, sys
+sys.path.insert(0, os.path.expanduser("~/.deepagents/agent/skills/d3d-elm-index"))
+from d3d_elm_index import (
+    elm_index_info, schema, runs, query_elm_index,
+    is_indexed, indexed_shots, shot_status, elm_windows, elm_bursts, was_elmy_at,
+    elm_statistics, find_shots,
+    signal_availability, shots_with_signals, coverage_summary,
+    compare_runs, fetch_estimate, locate_elm_db, ShotNotIndexed,
+    # ground truth and cross-method comparison -- rules 9, 9b, 10
+    label_sets, regime_windows, regime_at, compare_on_shot, compare_on_shots,
+    event_contrast, plot_comparison,
+    shots_with_multiple_sources, firing_rate_by_regime, events_by_regime,
+    regime_summary, elm_phase_at, select_by_elm_phase,
+)
+```
+
+## The twelve rules, in one place
+
+Read the rule that applies before answering. Each is spelled out below.
+
+1. **Absence is not evidence of absence** -- a shot not in the index was not
+   analysed; that is not "no ELMs".
+2. **Never compare counts across granularity** -- an `interval` row is an ELMy
+   phase, a `burst` row is one ELM.
+3. **Check coverage before quoting a proportion** -- the index is a non-uniform
+   subset, not a census.
+4. **Report a detector's parameters, never guess its algorithm** -- the code is
+   not in this image.
+5. **A label is an assertion by its producer, not a guarantee** -- a `labeled`
+   status means D-alpha transients were detected, and a regime class means a
+   labeller called the phase that. Never report a fraction of shots that "are
+   ELMy", and never write "no ELMs occurred here by definition".
+6. **Check `signal_snr`** -- it is dB and can be negative; the detector picks
+   the best available channel, not a good one.
+7. **Every time is milliseconds** -- 0-6000 is 6 seconds.
+8. **When the index falls short, offer a fetch with a cost, and put the offer
+   last** -- give the real numbers, end the answer with the offer so the reply
+   is the next thing, and wait. Closing on "this cannot be determined" is wrong
+   whenever the measurement is one question away.
+9. **The index holds ground truth as well as detector output** -- never present
+   a hand-labelled run as a detector result, or vice versa. Call
+   `label_sets()`.
+9b. **Detection is other people's work: report stored labels, and when a shot
+   has none, say so and offer to run a named existing detector.** Writing new
+   detection code is out of scope.
+10. **Never compare an ELM-event run against a regime-window run** -- same
+    granularity, different kind of statement. And clip to the comparable
+    window: ground-truth runs cover only the slice a person labelled.
+11. **Name the label set the conclusion rests on, and what else was
+    available** -- when several sets cover the shot, say which was used, name
+    the alternatives from `compare_on_shot(shot)`, and say the result is
+    conditional on that choice unless it has been re-run against them. Same
+    for the baseline window, the screening, and the averaging method.
+
+Rules 9 and 10 are spelled out first because they concern the most recently
+added data and are the easiest to get silently wrong; rules 1-8 follow.
+
+## Before those: how to talk to the person asking
+
+The user does not work on this system. They are a fusion scientist asking
+about DIII-D. Two habits matter.
+
+**Never make them supply a shot number they have no way to know.** "Find a
+shot where several methods can be compared" is a normal question and it has an
+answer -- `shots_with_multiple_sources()`. Never answer a question of that
+shape with "which shot?".
+
+```python
+X.shots_with_multiple_sources(min_sources=4)
+# [{'shot': 163518, 'n_sources': 4,
+#   'methods': ['human_elm_events', 'human_regime', 'omfit_elm', 'slope_outlier'],
+#   'ground_truth': ['human_elm_events', 'human_regime'], 'has_expert_labels': True}]
+X.shots_with_multiple_sources(min_sources=3)          # shots labelled by 3+ runs
+X.shots_with_multiple_sources(min_sources=2, require_ground_truth=True)   # ...incl. a hand-labelled run
+```
+
+**Never use our internal vocabulary in an answer.** These are implementation
+words. Translate:
+
+**Name each method by its `display_name`**, which every run declares and
+`label_sets()` returns. Use that one string everywhere in an answer -- prose,
+tables and figure labels -- so the same thing is not called two names:
+
+```python
+{r['method']: r['display_name'] for r in X.label_sets()['runs']}
+# {'slope_outlier': 'GA mode_classifier detector',
+#  'human_regime': 'Expert regime labels',
+#  'human_elm_events': 'Expert ELM events',
+#  'omfit_elm': 'OMFIT ELM detector'}
+```
+
+For the rest, translate:
+
+| do not say | say |
+|---|---|
+| "the ELM index" / "the database" | "DIII-D shot data" -- or just answer |
+| "run 4" | "the labels hand-made by a DIII-D expert" |
+| "granularity burst / interval" | "individual ELMs" / "ELMy phases" |
+| "none_found vs no_data" | "the detector ran and found nothing" vs "the data isn't there" |
+
+Name a run_id only when the person asks how something was produced, or when
+two runs would otherwise be ambiguous. Provenance still matters -- say which
+detector and which settings produced a number -- but say it in words a
+scientist uses.
+
+## Rule 9: the index holds ground truth, not just detector output
+
+Some runs are hand-labelled by a domain expert. They are the yardstick, not
+another opinion. `label_sets()` says which is which:
+
+```python
+for r in X.label_sets()["runs"]:
+    print(r["run_id"], r["method"], r["granularity"], r["kind"],
+          r["labeled_shots"], "of", r["shots"], "attempted",
+          "GROUND TRUTH" if r["is_ground_truth"] else "detector")
+```
+
+Each row carries `is_ground_truth` and two different shot counts. **Read them
+rather than assuming which run is which or how far it reaches** -- runs are
+added over time, and a hand-labelled run typically covers a small fraction of
+the shots a detector run does.
+
+**`shots` is how many shots the run was applied to. `labeled_shots` is how many
+carry labels. A sentence about reach needs the second one.** The gap between
+them is not an error: `status_counts` splits it into `error` (the method
+crashed) and `none_found` (the method ran and the shot genuinely holds no
+events). A hand-labelled run reports `none_found` when the expert looked and
+saw no ELMs -- which is a finding, and is why "the expert labelled N shots" and
+"N shots carry expert events" are different numbers.
+
+Write whichever one the sentence means, and say which:
+
+```python
+r = [x for x in X.label_sets()["runs"] if x["run_id"] == 4][0]
+print("applied to %d shots; %d carry events; %d ran and found nothing"
+      % (r["shots"], r["labeled_shots"], r["n_ran_and_found_nothing"]))
+```
+
+Ground-truth runs are **scoped**: they cover only the shots and time windows a
+person actually labelled. Outside that scope they assert nothing -- absence is
+Rule 1 again, more sharply.
+
+The detector runs are the blessed defaults. There is no implicit fallback: a
+query with no `run_id` uses the blessed run or raises. It never silently picks
+the newest, which would have quietly narrowed every answer to the handful of
+hand-labelled shots once the comparison runs were added.
+
+## Rule 9b: answer ELM counts from stored labels, never from new detection code
+
+**When asked how many ELMs a shot had:**
+
+1. Look up its stored labels. If a method has labelled it, report that count and
+   name the method that produced it.
+2. If no method has labelled it, say exactly that -- the shot has not been
+   analysed, so the count is unknown -- and offer to run one of the detectors
+   already in the system, or to fetch the D-alpha trace so a person can look.
+   Give the cost, and wait to be asked (Rule 8).
+
+**The number in an answer always comes from a named detector or a named person.**
+Deciding what counts as an ELM is the physics work this system deliberately does
+not do: it records, compares and serves other people's labels. A count produced
+by code written on the spot has no provenance, cannot be compared with anything
+else in the index, and will not reproduce.
+
+This is not hypothetical. Asked for the ELM count on an unanalysed shot, an
+agent fetched the raw trace unprompted, wrote a threshold detector, measured it
+over-counting by roughly six times, and still reported its number. Both halves
+were wrong: the fetch was not offered first, and the count had no provenance.
+
+If a question needs detection that does not exist yet, the honest answer names
+what is missing and stops there.
+
+## Rule 10: kind, not just granularity -- and clip the window
+
+A run's `granularity` says how finely it cuts time. It does **not** say what
+the labels mean:
+
+| kind | a row asserts | example run |
+|---|---|---|
+| `elm_events` | "an ELM occurred at t" | 1, 2, 4, 5 |
+| `regime_windows` | "the plasma was in QH-mode from t1 to t2" | 3 |
+
+Runs 1 and 3 are both `interval`. Differencing them yields a number that looks
+fine and means nothing. Use `compare_on_shot()`, which refuses across kinds and
+clips to the intersection of the runs' analysis windows -- one graded window in
+the answer key is 17 ms, so an unclipped whole-shot run would appear to have
+hundreds of "extra" events it never claimed were in that window.
+
+```python
+shot = X.shots_with_multiple_sources(min_sources=2)[0]["shot"]
+X.compare_on_shot(shot)
+# comparable_window_ms: [<lo>, <hi>]
+# one row per EVENT-LEVEL run that covers this shot:
+#   run_id, method, display_name, granularity,
+#   source              'ground truth' or 'detector'
+#   n_events_in_window  clipped to the comparable window
+#   status, error       'labeled' | 'none_found' | 'error' | 'no_data'
+# plus a `warning` when a detector CRASHED and therefore reported zero.
+```
+
+**Which runs appear depends on the shot, and the sets barely overlap.** A run
+covers a shot only if it was executed on it; do not assume the detector runs
+and the hand-labelled runs both reached any given shot. Check before comparing:
+
+```python
+[ (r["run_id"], r["status"]) for r in X.shot_status(shot) ]
+```
+
+**A run that is absent is not a run that found nothing.** Treating "never
+executed here" as "detected zero events" silently invents agreement -- observed
+on a real run, where an index-wide detector-vs-expert comparison counted
+never-analysed shots as detector zeros. `compare_on_shot()` lists only the runs
+that actually cover the shot, which is why it is the right call for this.
+
+**Report a crashed detector's zero as a failure, never as agreement.** When
+`status` is `error`, `n_events_in_window` is 0 because nothing ran, and the
+returned `warning` says so.
+
+Regime context, when the shot has it:
+
+**To report how long a shot spent in each regime, call `regime_summary(shot)`.**
+Adding the raw window durations double-counts the nested intervals -- on shot
+163518 that turns 3516 ms of quiescent time into 3830.
+
+```python
+X.regime_summary(163518)
+# {'by_regime_ms': {'WPQH': 2235.0, 'QH': 1281.0, 'ELMy H': 361.0},
+#  'elmy_ms': 361.0, 'quiescent_ms': 3516.0, 'labelled_ms': 3877.0,
+#  'unlabelled_ms': 2123.0,
+#  'elmy_percent_of_labelled': 9.3, 'elmy_percent_of_discharge': 6.0,
+#  'unlabelled_note': 'asserts nothing -- NOT L-mode; ...'}
+```
+
+**Unlabelled time is not L-mode.** The source's `MODE_INFO` line
+`"L", LMODE background (not labeled)` means L-mode was never marked -- not that
+unmarked time is L-mode. Ramp-up, ramp-down and anything the labeller skipped
+land in the same gap. Report it as "no regime was marked here", and give both
+percentages when quoting a fraction: the same span is a different number as a
+fraction of the whole discharge than as a fraction of the labelled time, and
+those are different claims.
+
+```python
+X.regime_windows(163518)[:2]
+# [{'start_ms': 0.0, 'end_ms': 8.0, 'regime': 'ELMy H',
+#   'means': 'ELMing H-mode -- the plasma IS producing ELMs'},
+#  {'start_ms': 1100.0, 'end_ms': 1820.0, 'regime': 'QH',
+#   'means': 'Quiescent H-mode -- good confinement, no ELMs, edge oscillates instead'}]
+X.regime_at(163518, 3000)
+# {'start_ms': 2480.0, 'end_ms': 5000.0, 'regime': 'WPQH', 'means': 'Wide-Pedestal Quiescent H-mode'}
+```
+
+### What these return
+
+```python
+X.compare_on_shot(163518).keys()
+# ['shot', 'comparable_window_ms', 'event_level', 'regime_context',
+#  'note', 'granularity_warning']
+```
+
+**The per-run list is `event_level`, not `runs`.** Each item has: `run_id`,
+`method`, `granularity`, `source` ('ground truth' | 'detector'),
+`n_events_in_window`, `status`, `error`. `regime_context`, `note` and
+`granularity_warning` appear only when they apply, so reach them with `.get()`.
+
+```python
+X.regime_at(163518, 3000)
+# {'start_ms': 2480.0, 'end_ms': 5000.0, 'regime': 'WPQH',
+#  'means': 'Wide-Pedestal Quiescent H-mode'}
+
+X.regime_at(163518, 900)          # a gap between labelled windows
+# {'regime': None, 'means': 'no hand-labelled regime covers this time ...'}
+```
+
+**`regime_at()` always returns a dict, and `['regime']` is `None` in the gaps**
+between labelled windows -- most shot time is unlabelled background. Coalesce
+before formatting: `(w['regime'] or 'unlabelled')`.
+
+Regime windows OVERLAP: narrow ELMy H intervals are nested inside broad
+QH/WPQH spans, marking ELMy stretches within an otherwise quiescent phase.
+`regime_at()` returns the most specific (narrowest) window covering the time,
+which is what makes "n in quiescent" counts correct -- resolving overlaps the
+other way inflated shot 163518 from 44 quiescent bursts to 75.
+
+### Building a timeline: hand `regime_at()` the whole timebase
+
+`regime_at()` takes a single time **or any sequence of times** and returns a
+list, resolved from one fetch:
+
+```python
+timeline = regime_at(shot, range(0, 6001))     # one call, not 6001
+```
+
+Do NOT loop it. `for t in range(0, 6001): regime_at(shot, t)` asks the same
+question six thousand times; before the windows were cached that was six
+thousand round trips and several minutes of silence, and it is still the wrong
+shape. Coalesce the returned list into segments in Python:
+
+```python
+segs, prev = [], None
+for t, r in enumerate(timeline):
+    lab = r["regime"] or "unlabelled"
+    if prev is None or lab != prev[0]:
+        if prev:
+            segs.append((prev[0], prev[1], t - 1))
+        prev = (lab, t)
+segs.append((prev[0], prev[1], len(timeline) - 1))
+```
+
+The windows themselves are cached per shot, so `regime_windows()` is free after
+the first call; pass `refresh=True` if labels have just been ingested.
+
+### Counting a detector's events by regime
+
+**For one shot, call `events_by_regime(shot)`; across shots, call
+`firing_rate_by_regime()`.** Both assign an event to the regime containing its
+**midpoint**, which is also what `plot_comparison()` prints in its row labels,
+so a figure and the sentence beside it cannot disagree.
+
+```python
+X.events_by_regime(163518)
+# {'shot': 163518, 'detector': 'GA mode_classifier detector', 'n_events': 91,
+#  'by_regime': {'WPQH': 37, 'ELMy H': 36, 'QH': 7},
+#  'n_quiescent': 44, 'n_elmy': 36, 'n_outside_any_labelled_regime': 11,
+#  'assignment': 'each event assigned by its midpoint'}
+```
+
+Events straddle regime boundaries, so the convention matters: counting shot
+163518 by start time gives 44 -> 46. Use these functions rather than binning by
+hand, and the whole answer stays on one convention.
+
+### Using ELM times to filter another diagnostic
+
+**To work out where a measurement falls in the ELM cycle, call
+`elm_phase_at(shot, times)`; to keep only the samples in part of the cycle, call
+`select_by_elm_phase(...)`.** Slow diagnostics -- Thomson, CER, ECE, bolometry --
+sample far slower than ELMs recur, so every sample lands at an arbitrary phase
+and averaging them smears out the structure being studied.
+
+Phase needs the BURST run's events, so it is defined only on shots that run
+covers. Pick one rather than assuming -- a shot may carry expert labels and no
+detector run, in which case these raise `ShotNotIndexed` and the message tells
+you to check `shot_status()`:
+
+```python
+shot = X.find_shots(min_bursts=1, limit=1)[0]["shot"]   # a burst-covered shot
+
+X.elm_phase_at(shot, [t0, t1])
+# ONE dict with PARALLEL LISTS, not a list of dicts:
+#   shot, run_id, method, n_times
+#   phase, in_elm, ms_since_last_elm, ms_until_next_elm, covered  <- lists
+#   n_in_elm, n_covered                                           <- totals
+# convention: 0 just after an ELM, rising to 1 just before the next;
+#             -1 to 0 during an ELM; None outside the event span
+
+X.select_by_elm_phase(shot, times, phase_range=(0.5, 1.0))
+# {'shot', 'run_id', 'method', 'phase_range', 'n_times', 'n_kept',
+#  'fraction_kept', 'keep_indices', 'n_dropped', 'min_ms_since_elm', 'caveat'}
+```
+
+Phase is derived from stored event times -- nothing is cached, and no column
+was added for it. `phase_range` is a scientific choice, not a default to trust.
+Full workflow guidance, including which run to use and how to validate the event
+times first, is in the **`d3d-elm-phase-analysis`** skill.
+
+### Population scale: does a detector fire when it should?
+
+**To answer "how often does this detector fire during quiescent periods" across
+many shots, call `firing_rate_by_regime()`.** One shot is an anecdote; this is
+the whole overlap between a detector and the expert's regime labels.
+
+```python
+X.firing_rate_by_regime()["elmy_vs_quiescent"]
+# {'elmy_events_per_second': 34.23, 'quiescent_events_per_second': 3.96, 'ratio': 8.6}
+```
+
+The shot counts and rates below move as the index grows -- read them from the
+call, not from here. Example output:
+```
+slope_outlier vs human_regime over 320 shots
+  ELMy H   317 shots   253.1 s   8664 events   34.23 /s
+  WPQH     136 shots   197.9 s   1377 events    6.96 /s
+  BBQH      84 shots    73.4 s    391 events    5.33 /s
+  QH       262 shots   317.4 s    566 events    1.78 /s
+```
+
+It resolves overlapping regime windows to the narrowest and uses each regime's
+exclusive duration, which hand-written versions get wrong in both directions.
+Report the ratio with its caveat: a non-zero quiescent rate is not
+automatically wrong, since quiescent phases can contain real ELMs.
+
+### Plotting a comparison
+
+**When asked to show, plot or visualise how methods differ, call
+`plot_comparison(shot)` and present its figure as the answer.**
+
+```python
+ax = X.plot_comparison(163518)          # returns a matplotlib Axes
+```
+
+It is already the complete comparison figure: each method on its own track,
+every event coloured by the regime it falls in, the quiescent count per method
+in the row label, a crashed detector marked as crashed, duplicate runs hidden,
+and granularities kept apart. A figure assembled by hand has to get all of
+that right; one attempt shaded the band labelled "ELMs expected" across the
+quiescent stretch, asserting the opposite of its own conclusion.
+
+**To change the size, pass `figsize` to the call:**
+
+```python
+X.plot_comparison(163518, figsize=(14, None))   # wider, height stays automatic
+X.plot_comparison(163518, figsize=(14, 6))      # both fixed
+```
+
+The figure sets its own height from the number of label sets, roughly 0.6 inch
+per row, and scales its type with the width so it stays legible at whatever
+size the notebook renders it. Resizing it afterwards with
+`fig.set_size_inches()` leaves the rows at their data coordinates and the type
+at its original size, so the result is blank space between rows and text too
+small to read.
+
+The default 9.5 inches is tuned for a notebook cell. Go wider only when the
+time axis is genuinely crowded.
+
+**To show whether a detector fires during quiescent periods on a given shot,
+call `plot_comparison(shot)`** -- the hand-labelled regime background and the
+per-row "n in quiescent" count answer that question directly, for any shot with
+regime labels, whether or not a second detector or expert ELM list exists.
+
+**To add a view the function does not provide, pass `ax=` and draw onto the
+same axes**, so the answer carries one figure rather than two that can
+disagree about the same shot.
+
+Pass `dalpha={'times':..., 'data':...}` from d3d-filterscopes to overlay the
+waveform the detectors looked at; without it the tracks still render, since
+this skill must not require the network. `run_ids=` chooses which sets appear.
+
+### Reporting how often a method failed
+
+**Read `n_failed` from `label_sets()`** -- it counts shots with status
+`error`. A count of zero-event shots would merge a crash with an honest "ran
+and found nothing", which are different claims about the machine:
+
+Each row of `label_sets()['runs']` carries: `run_id`, `method`, `granularity`,
+`kind`, `source`, `is_ground_truth`, `shots`, `status_counts`, `n_failed`,
+`n_ran_and_found_nothing`, `is_default`, `notes`.
+
+```python
+{r['method']: (r['n_failed'], r['n_ran_and_found_nothing'])
+ for r in X.label_sets()['runs']}
+# {'slope_outlier': (313, 119), 'human_regime': (0, 0),
+#  'human_elm_events': (0, 6), 'omfit_elm': (4, 4)}
+# omfit_elm: 4 crashed, 4 ran and found nothing -- NOT '8 failures'.
+```
+
+## Rule 11: name the label set the conclusion rests on, and what else was available
+
+**When more than one label set covers the shot, the answer must say which one
+the result was computed from, name the alternatives, and state that a different
+choice may change the conclusion unless that has actually been checked.**
+
+The choice is usually invisible in the result. `compare_on_shot(shot)` lists
+every set covering a shot, tagged by source:
+
+```python
+compare_on_shot(169908)["event_level"]
+# run 1  GA mode_classifier detector   interval   1 event    detector
+# run 2  GA mode_classifier detector   burst     21 events   detector
+# run 4  Expert ELM events             burst     22 events   ground truth
+# run 5  OMFIT ELM detector            burst     21 events   detector
+```
+
+Four sets, three of them event-level, on one shot. An analysis keyed to any of
+them is defensible; an analysis that does not say which it used is not
+checkable.
+
+**Why this matters more than it looks.** The sets do not agree on timing. On
+this shot the detector's event starts run roughly a millisecond earlier than
+the expert's. For a question about *how many ELMs* that is irrelevant. For a
+question about *how long before an ELM something happens*, a systematic
+millisecond is the same size as the effect being measured, and the conclusion
+can follow the label set rather than the physics.
+
+Verified: the same seven-question analysis, run twice with identical wording,
+selected different label sets and reached different conclusions about a
+millisecond-scale lead time. Neither run stated that another set was available.
+A reader of either answer had no way to know the choice existed.
+
+**What to write.** One sentence with the result, of the form:
+
+> Computed from *(name of set)*. Shot 169908 also has *(the others)*; this
+> result has not been re-run against them, so treat the lead time as
+> conditional on that choice.
+
+If it *has* been re-run against another set, say what changed. "The result is
+the same under both" is a much stronger statement than a number alone, and it
+costs one extra run.
+
+**This applies to every free choice the analysis made**, not only label sets:
+the baseline window, the event screening, the averaging method. State them with
+the result. A conclusion whose assumptions are not visible cannot be checked by
+the person reading it, and the person reading it is usually the only one who
+knows whether the assumption was reasonable.
+
+## Rule 1: absence is not evidence of absence
+
+This is the single most important thing about this index and the easiest error
+to make.
+
+The index covers **a subset of the archive that grows over time**. A shot that
+is not in it has *not been analysed*. That is completely different from a shot
+that was analysed and found to have no ELMs.
+
+Functions raise `ShotNotIndexed` rather than returning an empty list, so this
+cannot be missed by accident:
+
+```python
+elm_windows(999)
+# ShotNotIndexed: shot 999 is not in the ELM index -- it has not been analysed.
+```
+
+**`shot_status(N)` returns a LIST -- one row per run, not a single verdict.**
+A shot has a status per method, and they differ: a detector can crash on the
+same shot where an expert found nothing.
+
+```python
+X.shot_status(163518)          # 5 rows, one per run
+# [{'run_id': 1, 'method': 'slope_outlier', 'granularity': 'interval',
+#   'status': 'labeled', 'n_labels': 6, ...},
+#  {'run_id': 2, 'method': 'slope_outlier', 'granularity': 'burst',
+#   'status': 'labeled', 'n_labels': 91, ...}, ...]
+# row keys: run_id, method, granularity, status, signal_used, signal_snr,
+#           t_start, t_end, n_labels, error
+```
+
+Report "shot N has no ELMs" only for a run whose row says `none_found`, and say
+which method it was.
+
+The same distinction applies within an analysed shot. `elm_run_shots.status`:
+
+| status | meaning |
+|---|---|
+| `labeled` | analysed, ELMs found |
+| `none_found` | analysed, genuinely no ELMs |
+| `no_data` | the signal could not be fetched (reason in `error`) |
+| `error` | data returned but unusable by this detector (reason in `error`) |
+
+## Rule 2: never compare across granularity
+
+The same detector produces two different products depending on one parameter:
+
+- **`interval`** -- one row per continuous **ELMy phase** (many ELMs).
+- **`burst`** -- one row per **individual ELM**.
+
+An interval count and a burst count are not comparable. For shot 149058 the
+same detector gives 2 interval rows and 82 burst rows. Use `elm_windows()` for
+phases and `elm_bursts()` for individual ELMs; `compare_runs()` refuses to
+difference two runs of differing granularity and returns a warning instead.
+
+## Rule 3: check what is in the index before quoting a proportion
+
+Call `elm_index_info()` first. It returns coverage, status counts, the label
+classes actually present, and caveats. Two traps it exposes:
+
+- The indexed shots are **not a uniform sample**. The index is built in batches
+  with different sampling strategies -- an even stride, a validation set, and
+  contiguous blocks -- so percentages over the whole index are skewed. The
+  caveat returned by `elm_index_info()` is **computed from the data**, so it
+  describes the current composition rather than a fixed description that goes
+  stale. Use `coverage_summary()` to see the distribution, and restrict to a
+  known-unbiased shot list for an archive-representative figure.
+- `label_classes` pools the classes of EVERY run, so it now mixes a detector's
+  ELM classes, the expert's regime classes and the answer key's type codes.
+  Read a class back to the run that produced it -- `QH` appearing in the list
+  means the human regime labeller emits it, not that a detector claims QH.
+  `label_sets()` gives the per-run breakdown.
+
+`elm_index_info()` is the orientation call. It returns:
+
+```python
+info = elm_index_info()
+# shots_indexed          how many shots have been through a detector
+# shot_range             (lowest, highest) shot in the index
+# status_counts          labeled / no_data / error / none_found
+# labels                 label count per run, keyed 'run N (granularity)'
+# label_classes          every class name, POOLED ACROSS RUNS -- read each one
+#                        back to its run via label_sets()
+# channels_tracked       the D-alpha channels the detector ran on
+# low_snr_labeled_shots  shots labelled despite a weak trace
+```
+
+**Quote these from the call, never from memory.** The index grows as more shots
+are ingested and as new runs are added, so every one of these values moves.
+
+## More than one shot? Use the batch call
+
+Every helper here talks to a service over HTTP, so a single-shot helper costs
+one round trip. A loop over a shot list turns one question into hundreds of
+requests -- the difference between a second and several minutes, and the cell
+looks hung while it happens because output is buffered until the script ends.
+
+| one shot | many shots |
+|---|---|
+| `is_indexed(shot)` | `indexed_shots(shots)` -> sorted list |
+| `compare_on_shot(shot)` | `compare_on_shots(shots)` -> {shot: same dict} |
+| -- | `shots_with_signals(signals, lo, hi)` |
+| -- | `find_shots(...)`, `fetch_estimate(shots)` |
+
+`shots_with_multiple_sources()` and `label_sets()` are already index-wide.
+
+The single-shot forms are still there and still correct; they are for one shot.
+**If a question mentions a range, a cohort, "which shots", "compare across" or
+any plural, the query should mention them all.**
+
+Comparing label sets on several shots is the case worth calling out, because
+getting it wrong is silent rather than slow. Each shot has its OWN comparable
+window -- the intersection of the analysis windows the runs recorded for that
+shot -- and every count is clipped to it. `compare_on_shots()` resolves each
+shot's window separately; a hand-rolled comparison that reuses one shot's
+window for another, or that derives a window from the span of the labels
+instead of the recorded window, returns counts that look reasonable and are
+wrong. Let the helper compute the window.
+
+## Comparing a signal during events against between them
+
+"How much stronger was this quantity during the events?" is a question about
+any time series, not one particular signal. `event_contrast()` answers it:
+give it a fetched trace and a shot, and it splits the samples by the stored
+windows and reports the statistic inside, outside, and their ratio.
+
+It returns SEVERAL variants, not one number, because the answer depends on how
+much of the window you count as the event -- and that is a property of the
+detector, not of the physics:
+
+```python
+from d3d_elm_index import event_contrast
+
+rows = event_contrast(times, values, shot=185258,
+                      t_start=2500, t_end=5000,      # the flat-top
+                      peak_ms=1.0)                   # also report "at the peak"
+for r in rows:
+    print("%-26s ratio=%.2f  window=%.2f ms  duty=%.2f"
+          % (r["variant"], r["ratio"], r["window_ms"], r["duty"]))
+```
+
+```
+full window                ratio=1.72  window=4.54 ms  duty=0.42
+trimmed 1 ms/end           ratio=2.11  window=2.54 ms  duty=0.23
+peak 1 ms of each window   ratio=3.22  window=1.00 ms  duty=0.09
+```
+
+The run's own recorded padding is trimmed automatically as one of the variants,
+so the padded and unpadded answers appear side by side without your having to
+know the parameter exists.
+
+**Read across the variants before quoting one.** A ratio that climbs steeply as
+the window narrows -- as it does above, 1.7 to 3.2 -- means the window is wider
+than the feature, so a window average is diluted toward the between-event
+level. A ratio that is flat across the variants means the window width is not
+the story and the number is robust.
+
+**Which variant to quote depends on the question.** "How much brighter,
+averaged over the whole event?" is the full window. "How much brighter at the
+peak?" is `peak_ms`. If you are comparing against a measurement from another
+instrument, the two must be averaging over comparable spans, or they are
+answering different questions and will disagree for reasons that have nothing
+to do with the physics.
+
+**Check the per-shot spread, not just the pooled mean.** Run it per shot and
+compare: a pooled mean that lands on a target while the per-shot values scatter
+far more widely than the target's own spread has not reproduced anything.
+
+## A burst window is a detector's interval, not the event's duration
+
+A stored window says "the detector marked this span". Its width comes from the
+detector's own settings -- thresholds, smoothing, a merge time, and any padding
+added at each end -- all of which are recorded in the run's `parameters`. Read
+them before treating a width as physical:
+
+```python
+import json
+meta = {r["run_id"]: r for r in runs()}      # never index runs() by position
+params = json.loads(meta[run_id]["parameters"])
+# look for padding, merge time, filter width
+```
+
+**Anything averaged over a window inherits that width.** If the window is wider
+than the feature -- padding alone guarantees some of this -- an average over it
+is diluted toward the between-event level, and the wider the window the closer
+the ratio drifts to 1. A quantity measured *during* events and compared against
+an independent instrument is especially exposed, because the two are then
+averaging over different spans.
+
+When such a comparison disagrees, the window width is a hypothesis you can
+TEST rather than argue about. It predicts something specific: restrict each
+window to its highest-signal core, or trim the recorded padding, and recompute.
+If the disagreement closes as the window narrows, the width explains it. If the
+ratio is flat as the window narrows, it does not, and the difference is real.
+
+Two-level dilution arithmetic makes the size of the effect explicit: if a
+fraction `f` of a window is the genuine event and the rest sits at the baseline,
+then `measured = f * true + (1 - f)`. Solving for `f` turns a disagreement into
+a statement about how much of the window is real, which can be checked against
+the physical duration the events are expected to have.
+
+## The database is PostgreSQL -- what that changes
+
+The service runs PostgreSQL. A thin compatibility layer at the boundary absorbs
+the SQLite spellings that translate exactly, so these all work as written and
+need no thought:
+
+| you write | why it works |
+|---|---|
+| `?` placeholders | rewritten to `%s` |
+| `LIKE 'FS04%'` | rewritten to `ILIKE`, keeping SQLite's case-insensitive match |
+| `IFNULL(x, 0)` | renamed to `COALESCE` |
+| `ROUND(x, 2)` on a float | an overload is installed for it |
+
+Everything else is PostgreSQL, and these four are the ones that actually cost
+retries. Each was confirmed against the live service:
+
+| this fails | error | write instead |
+|---|---|---|
+| `GROUP_CONCAT(sig, ',')` | `function group_concat(text, unknown) does not exist` | `STRING_AGG(sig, ',')` |
+| a SELECT alias in `HAVING` | `column "n" does not exist` | wrap in a subquery |
+| a SELECT alias in `WHERE` | `column "r" does not exist` | wrap in a subquery |
+| an aggregate in `GROUP BY` | `aggregate functions are not allowed in GROUP BY` | wrap in a subquery |
+
+`GROUP_CONCAT` is not auto-translated on purpose: `STRING_AGG` takes a
+delimiter argument, so a silent rewrite would have to invent one, and a
+rewrite that changes meaning is worse than an error naming the function.
+
+The subquery form covers three of the four:
+
+```sql
+SELECT * FROM (
+  SELECT shot, COUNT(*) AS n FROM signal_availability GROUP BY shot
+) t WHERE n > 1
+```
+
+**Every selected column must be grouped or aggregated.** `SELECT shot, signal,
+COUNT(*) ... GROUP BY shot` fails with `column "signal" must appear in the
+GROUP BY clause`; SQLite would have picked an arbitrary row. Per-shot constants
+look redundant in a `GROUP BY` and still have to be listed.
+
+## One query per shot is one round trip per shot
+
+`is_indexed()`, `shot_status()` and the other single-shot helpers each cost one
+HTTP round trip. Over a shot RANGE that is the difference between a second and
+several minutes, and it is the one mistake that has actually made a cell look
+hung:
+
+```python
+unchecked = [s for s in plasma if not is_indexed(s)]   # one request PER SHOT
+```
+
+A span a few thousand shots wide holds a comparable number of plasma shots,
+so that line alone is thousands of sequential requests -- and a script that then calls
+`fetch_estimate(unchecked)` pays for the same walk again. Ask the index once
+instead:
+
+```python
+rows = query_elm_index(
+    "SELECT DISTINCT shot FROM elm_run_shots WHERE shot BETWEEN ? AND ?",
+    (lo, hi))
+indexed = {r["shot"] for r in rows}
+unchecked = [s for s in plasma if s not in indexed]
+```
+
+**This applies to raw SQL exactly as it applies to the helpers.** A loop like
+
+```python
+for s in shots:                                    # one request PER SHOT
+    rows = query_elm_index(
+        "SELECT run_id, status FROM elm_run_shots WHERE shot = ?", (s,))
+```
+
+is the same mistake wearing different clothes -- observed on a 300-shot list,
+where it cost 300 round trips against a single range query that returned the
+same 600 rows in one. Fetch the range once and group in Python:
+
+```python
+rows = query_elm_index(
+    "SELECT shot, run_id, status FROM elm_run_shots"
+    " WHERE shot BETWEEN ? AND ? ORDER BY shot, run_id",
+    (min(shots), max(shots)))
+want = set(shots)
+by_shot = {}
+for r in rows:                                     # no network in this loop
+    if r["shot"] in want:
+        by_shot.setdefault(r["shot"], []).append(r)
+```
+
+Two tells that a loop is about to be expensive: the query text does not change
+between iterations, and the loop variable appears in the parameters. Identical
+repeated queries are served from an in-process memo and cost nothing, but a
+loop with a DIFFERENT shot each time misses that memo on every pass -- it is
+genuinely N requests.
+
+`query_elm_index` accepts a sequence for the common shape, so an explicit list
+needs no range at all:
+
+```python
+rows = query_elm_index(
+    "SELECT shot, run_id, status FROM elm_run_shots WHERE shot IN (?)", (shots,))
+```
+
+`shots_with_signals()` and `fetch_estimate()` are already set-based internally,
+so prefer them over hand-rolled loops. The general rule: **if the question is
+about a range, the query should mention the range.** A per-shot helper answers
+about one shot.
+
+## Rule 4: report a detector's PARAMETERS, never guess its ALGORITHM
+
+`parameters` tells you `pos_deriv_thresh = 2.7` and
+`lowpass_cutoff_freq = 2000.0`. It does **not** tell you what that threshold is
+normalised against, how the baseline is estimated, or in what order the steps
+run. The algorithm lives in the source repository, which is **not installed in
+this image** -- you cannot read it from here.
+
+So when asked what a detector *does*: give the method name, version, commit,
+repo and the full parameter set, and say the internals must be read from that
+repo. Do **not** reconstruct the mechanism from parameter names.
+
+Two plausible inventions have already reached a reviewer this way:
+
+| invented | actual |
+|---|---|
+| thresholds are "MAD-normalised" | the reference detector fits a **gamma** distribution; MAD appears nowhere in it |
+| the code is "legacy Python 2" | it is **Python 3**; the compatibility patch was for a pandas 2 / toksearch 2.x API change |
+
+Both were stated confidently and both were wrong. "The parameters are X; the
+algorithm is documented at <repo>@<commit>" is the complete, correct answer.
+
+## Rule 5: a label is an assertion by its producer, not a guarantee
+
+Every label in this index -- detector or human -- records that someone or
+something **asserted** a state over an interval. It does not guarantee the
+physics held throughout, and it does not exclude what the producer did not look
+for. Write "the expert marked this phase quiescent", never "no ELMs occurred
+here by definition".
+
+The evidence is in the data itself: narrow ELMy intervals are labelled *inside*
+broad quiescent spans on the same shot, and one hand-labelled case is described
+as "QH mode broken by ELM clusters". A regime class names the dominant
+behaviour a labeller saw, not an impossibility proof. The same applies to
+`none_found`: it means the detector ran and found nothing, not that the
+discharge was quiet.
+
+### `labeled` does not mean the discharge was ELMy
+
+This is the most important limitation of the label set, and the one most likely
+to produce a confident wrong answer.
+
+`status = 'labeled'` means **the detector found D-alpha transients**. It does
+not mean the discharge was in ELMy H-mode. The detector almost never declines:
+`none_found` is a small fraction of a percent of analysed shots.
+
+Validation confirms this is over-labelling, not physics. Run against discharges
+that domain experts hand-labelled as QH-mode -- a regime that by definition has
+no ELMs -- the detector labelled **every single one**. QH-mode carries edge
+harmonic oscillations and real D-alpha activity, and a slope threshold responds
+to it.
+
+**Therefore, the correct answer to "what fraction of DIII-D shots are ELMy?"
+is that this index cannot answer it.** Not "98.8% of analysed shots", not any <!-- lint-ok: a forbidden answer, quoted so it can be recognised -->
+figure with caveats attached. The label is not an ELMy/not-ELMy classification,
+so no denominator rescues it. Say so plainly, and say why: the detector labels
+essentially everything with a usable D-alpha trace.
+
+The same applies to any question of the form "how many / what proportion of
+shots are ELMy", "is shot N an ELMy discharge", or "find me the non-ELMy
+shots".
+
+**Magnitude carries the signal; the binary does not.** Burst count and total
+ELMy duration separate regimes far better than the presence of a label -- QH
+discharges score markedly lower on both than the index at large, though the
+distributions overlap and no clean threshold exists. When a question is really
+about ELM behaviour, use `elm_statistics()` and compare magnitudes rather than
+counting labelled shots.
+
+## Working examples (all verified against the real index)
+
+### One shot: everything known about it
+
+```python
+elm_statistics(149058)
+# {'shot': 149058, 'n_windows': 2, 'n_bursts': 82,
+#  'elmy_duration_ms': 3595.04, 'first_elm_ms': 65.46, 'last_elm_ms': 5121.84,
+#  'frequency_hz': 22.81, 'mean_period_ms': 43.84, 'mean_burst_ms': 5.41,
+#  'signal_used': 'fs04da', 'status': 'labeled'}
+```
+
+`frequency_hz` is bursts divided by ELMy duration -- the rate *while ELMing*,
+not averaged over the whole discharge.
+
+### ELMy phases, and individual ELMs inside a time window
+
+```python
+elm_windows(149058)
+# [{'start_time': 65.46, 'end_time': 97.02, 'duration_ms': 31.56,
+#   'label': 'ELMy H', 'confidence': None, 'run_id': 1}, ...]   # 2 rows
+
+elm_bursts(149058, 2000, 2200)
+# [{'start_time': 2017.86, 'end_time': 2025.30, 'duration_ms': 7.44,
+#   'label': 'ELMy H'}, ...]                                    # 4 rows
+```
+
+### Point query: was the plasma ELMy at this instant?
+
+```python
+was_elmy_at(149058, 3000)
+# {'start_time': 1558.36, 'end_time': 5121.84, 'label': 'ELMy H'}
+was_elmy_at(149058, 200)
+# None
+```
+
+`None` means no ELMy phase covers that time. It does **not** mean L-mode -- the
+quiet period could be ELM-suppressed H-mode or QH-mode, which this detector
+does not distinguish.
+
+### Finding shots by ELM behaviour
+
+`find_shots()` takes any combination of criteria, ANDed together:
+
+```python
+find_shots(min_elmy_ms=4000, limit=3)
+# [{'shot': 142183, 'status': 'labeled', 'signal_used': 'fs04da',
+#   'signal_snr': 25.04, 'n_windows': 2, 'elmy_ms': 5084.2, 'n_bursts': 245}, ...]
+
+find_shots(shot_min=200000, signal_used='fs03da')     # by channel and era
+find_shots(min_bursts=300)                            # heavily ELMing shots
+find_shots(status='error')                            # data-quality triage
+```
+
+Available criteria: `shot_min`, `shot_max`, `status`, `signal_used`,
+`min_windows`, `min_elmy_ms`, `max_elmy_ms`, `min_bursts`, `label`, `limit`.
+
+### Which channel produced the label, and why it matters
+
+The detector ranks candidate channels by signal-to-noise **per shot**, so the
+diagnostic varies within one run. Always report `signal_used` when comparing
+shots -- a difference between two shots may come from the channel, not the
+plasma.
+
+```python
+query_elm_index("""SELECT signal_used, COUNT(*) n FROM elm_run_shots
+                   WHERE run_id = 1 AND signal_used IS NOT NULL
+                   GROUP BY 1 ORDER BY n DESC""")
+# [{'signal_used': 'fs04da', 'n': 430}, {'signal_used': 'fs03da', 'n': 95},
+#  {'signal_used': 'fs05da', 'n': 38}]
+```
+
+Note this aggregate is skewed by the index's non-uniform sampling (Rule 3), and
+the preferred channel also drifts with shot era.
+
+## Rule 6: check `signal_snr` before trusting a shot's labels
+
+`signal_snr` is in **dB and can be negative**. The detector picks the *best
+available* channel, not a *good* one, and labels the shot regardless. In the
+current index **653 labelled shots have negative SNR** -- noise exceeding
+signal (`elm_index_info()['low_snr_labeled_shots']`):
+
+```python
+query_elm_index("""SELECT shot, ROUND(signal_snr,1) snr, signal_used, n_labels
+                   FROM elm_run_shots WHERE run_id = 1 AND signal_snr < 0
+                   ORDER BY signal_snr LIMIT 3""")
+# [{'shot': 192179, 'snr': -10.5, 'signal_used': 'fs04da', 'n_labels': 7},
+#  {'shot': 188421, 'snr': -9.3,  'signal_used': 'fs05da', 'n_labels': 1},
+#  {'shot': 183857, 'snr': -8.2,  'signal_used': 'fs05da', 'n_labels': 2}]
+```
+
+Shot 188421 has 443 burst labels from a -9.3 dB channel. Those labels exist,
+but presenting them as a confident measurement would be wrong. Flag low SNR
+when reporting per-shot results, and consider excluding `signal_snr < 0` from
+aggregate statistics.
+
+`signal_snr` can also be `inf` (a channel with no measurable noise); guard
+against it in arithmetic.
+
+## Rule 7: every time in this index is in MILLISECONDS
+
+`start_time`, `end_time`, `t_start`, `t_end`, `elmy_duration_ms`,
+`first_elm_ms` -- all milliseconds. A full discharge runs 0 to ~6000, which is
+**6 seconds, not 6000 seconds**. Labelling those as seconds is a 1000x error
+and it has actually happened in review. Derived rates are Hz, and `rate_khz` is
+kHz.
+
+When you print a time, put `ms` in the column header.
+
+## Rule 8: when the index falls short, OFFER a fetch -- do not just say "unknown"
+
+The index is a cache over a much larger archive. When a question needs a shot
+it does not cover, "not indexed" is a true but unhelpful answer. The raw data
+usually **is** reachable from Pelican.
+
+The required behaviour, in order:
+
+1. Say what the index knows.
+2. **Run `fetch_estimate()` and put its numbers in your answer** -- the actual
+   gigabytes and minutes, written out.
+3. Ask whether to proceed, and wait.
+
+Step 2 is the one that gets skipped. "I can run a fetch estimate, just say the
+word" is **not** an acceptable answer: it offers to do arithmetic instead of
+doing it, and leaves the user unable to decide. Nor is a large number a reason
+to withhold it -- "completing this range means ~108 GB and about 80 minutes"
+is exactly what lets someone say "no, do a narrower slice". Silence about the
+cost is worse than a big number.
+
+Do not fetch unprompted -- fetching is slow and metered, and the user may not
+want it. But always price it.
+
+**Put the offer last.** When an answer contains both limitations and an offer,
+the offer is the final thing written, after any closing summary. A question
+that asks what the data cannot do invites a summary of limits, and an offer
+placed above that summary is buried: the reader's last impression is a dead
+end. "X cannot be determined from these labels" as a closing line is wrong
+whenever the measurement is one question away -- close instead with what you
+can do about it, and stop there so the reply is the next thing.
+
+Use `fetch_estimate()` so the numbers are measured, not guessed:
+
+```python
+fetch_estimate(186000)
+# {'requested': 1, 'already_indexed': [], 'would_fetch': [186000],
+#  'megabytes': 31.0, 'seconds': 1.4, 'seconds_8_workers': 0.9,
+#  'megabytes_note': '31.0 MB/shot crosses the wire; only 9.6 MB/shot is
+#                     decoded and used',
+#  'likely_no_data': [], 'can_answer_by_fetching': [...], ...}
+
+fetch_estimate(range(200000, 200020))
+# -> total megabytes, serial seconds, and seconds at 8 workers
+```
+
+It also flags shots below the filterscope coverage boundary as
+`likely_no_data` — cheap misses at ~0.65 s and no payload — so a wide old range
+is not over-quoted. The boundary itself comes from the estimate, not from a
+number written here; filterscope coverage begins partway through the archive
+and a range reaching below it will be mostly misses.
+
+**Quote `megabytes` as the transfer cost, not the array size.** Reading four
+channels pulls whole tree files, so ~31 MB crosses the wire per shot while only
+~9.6 MB is decoded. Using the array figure understates transfer threefold.
+
+**Be precise about what a fetch would and would not settle**, because the two
+differ here:
+
+| Fetching CAN answer | Fetching CANNOT answer |
+|---|---|
+| which channels exist for the shot | ELM labels from GA's detector |
+| sampling rate and time coverage | when the shot was ELMy |
+| the raw D-alpha trace (plot it, count peaks) | anything requiring the stored label set |
+
+GA's `mode_classifier` is **not installed in this image**, so new ELM labels
+cannot be produced here. Offering to "detect the ELMs" for an un-indexed shot
+would be a promise the environment cannot keep. Fetching the trace and plotting
+it, so the user can see the ELM spikes, is honest and often enough.
+
+A good response to "how many ELMs in shot 186000?" therefore looks like:
+
+> Shot 186000 has not been analysed, so the index has no count -- and that is
+> not evidence it had none. I can fetch its D-alpha filterscope data (~9.6 MB,
+> about 1.4 s) to confirm the channels exist and show you the trace, but I
+> cannot produce ELM labels here: GA's detector is not installed in this image.
+> Shall I fetch it?
+
+**This applies to ranges too, not just single shots.** "Which shots in
+190000-195000 have channel X" is answered over the shots the index has checked,
+and the rest are unknown. Say how many shots the range actually contains (query
+d3drdb -- do not count shot numbers), how many were checked, and what completing
+it would cost:
+
+```python
+from d3d_relational_db import plasma_shots_in_range
+rng = plasma_shots_in_range(190000, 195000)     # 3507 real shots, not 5001 numbers
+est = fetch_estimate(rng)
+# would_fetch 3487 shots -> ~33.5 GB, ~4952 s
+```
+
+When the estimate is large, still give it -- "completing this range means ~33 GB
+and about 80 minutes" lets the user decide, and a narrower sub-range is often
+the sensible counter-offer. Silence about the cost is worse than a big number.
+
+The shot number above is only an illustration. **Always check the actual index
+with `is_indexed()` before saying a shot is or is not covered** -- this document
+is not a list of which shots are indexed, and it goes stale as the index grows.
+
+To actually perform the fetch once the user says yes, use `d3d-filterscopes`.
+
+### RMP suppression: what to offer
+
+No run in this index labels RMP suppression, so when a question turns on it,
+Rule 8 applies: say what the labels do cover, then make the offer, and put it
+last. For example:
+
+> No expert marked RMP suppression for this shot. I can fetch the twelve I-coil
+> currents -- about 2.3 seconds -- and show you when they were energised.
+> Shall I?
+
+DIII-D's twelve non-axisymmetric (I-)coils are **PTDATA pointnames**, fetched
+with `PtDataSignal` through `d3d-shot-fetcher`:
+
+```
+IU30  IU90  IU150  IU210  IU270  IU330
+IL30  IL90  IL150  IL210  IL270  IL330
+```
+
+Measured cost, shot 158115: **all twelve in 2.3 s, 125.7 MB decoded; one coil
+in 0.2 s, 10.5 MB.** About 1.3 million samples per coil, in amps, on a
+millisecond time base.
+
+Two things to state when reporting what comes back:
+
+**The current is the measurement; "suppression" is an interpretation.** Report
+the coil currents and their time intervals. Deciding how many amps counts as
+energised is a judgement for the facility, not one to make here — see Rule 9b,
+which applies to regimes exactly as it applies to ELM counts. A threshold taken
+relative to each shot's own maximum is demonstrably wrong: a QH-mode discharge
+whose coils never leave the noise floor gets marked energised almost
+throughout, because its own maximum is tiny -- while a genuine RMP case peaks
+nearly an order of magnitude higher. Compare against an absolute current, and
+report the amps either way.
+
+**These coils are in PTDATA, not in the MDSplus `operations` tree.** Querying
+that tree returns `TreeNODATA` for most shots, which reads as "the archive does
+not have it" and is wrong. We reported RMP as blocked on that basis for weeks.
+
+### Signal availability, independent of any detector
+
+```python
+signal_availability(shot=149058)
+# 4 rows, e.g. {'shot': 149058, 'signal': 'fs04da', 'present': 1,
+#   'n_samples': 300000, 't_start': 0.02, 't_end': 6000.0,   # <- MILLISECONDS
+#   'rate_khz': 50.0, 'units': 'ph/cm2/sr/s', 'error': None}
+#
+# t_start/t_end are ms: this channel spans 0.02 ms to 6000 ms = 6 seconds.
+# `units` describes the DATA (photon flux), not the time axis.
+
+signal_availability(present=0, limit=2)
+# {'shot': 55102, 'signal': 'fs03da', 'present': 0, ..., 'error': 'TreeFOPENR'}
+```
+
+`present=1` is not the same as *usable*: a channel can be present as a single
+sample at t=0, or at 0.5-1 kHz which is far too slow to resolve ELMs. Check
+`n_samples` and `rate_khz`, not just `present`.
+
+**`rate_khz` is measured, not nominal, so bin it with care.** Values arrive in
+near-duplicate pairs -- 50.0 *and* 49.951, 100.0 *and* 99.902, 10.0 *and*
+9.996 -- because the rate is derived from the median sample spacing. Two
+consequences:
+
+- Grouping by the exact value fragments every nominal rate into two rows.
+- Rounding to the nearest integer merges 0.5 kHz into the 1 kHz bin, because
+  half-way values round up.
+
+Bin with an explicit tolerance instead, and **never present a rounded bin
+alongside its own constituents** -- a table listing both "~1 kHz: 256" and
+"0.5 kHz: 198" double-counts the 198. This has already reached a reviewer.
+
+```python
+shots_with_signals(['fs04da', 'fs03da'], 190000, 195000)
+# {'have': [...], 'missing': [...],
+#  'not_indexed_note': 'N shots in this range have been checked. Any shot in
+#   the range not listed in either group has never been fetched, and its
+#   availability is unknown -- not absent.'}
+```
+
+Always pass on that note when answering a range question -- the honest answer
+distinguishes "checked and absent" from "never checked".
+
+### Where in the archive the index has data
+
+```python
+coverage_summary()
+# [{'bucket': 50000, 'shots_indexed': 13, 'usable': 0, 'labeled': 0},
+#  ...
+#  {'bucket': 130000, 'shots_indexed': 34, 'usable': 30, 'labeled': 30}, ...]
+```
+
+### Detector provenance and method comparison
+
+```python
+runs()
+# run_id, method, method_version, granularity, parameters (JSON),
+# source_repo, source_commit, signal_candidates, created_at, is_default, notes
+
+cmp = compare_runs(1, 2, shot=149058)
+# cmp['comparable'] -> False
+# cmp['granularity_warning'] -> "run 1 is 'interval' and run 2 is 'burst' --
+#     these are different products. Counts are not comparable..."
+# cmp['per_shot'] -> [{'shot': 149058, 'n_a': 2, 'n_b': 82}]
+```
+
+To read a run's parameters, parse the JSON:
+
+```python
+import json
+json.loads(runs()[0]["parameters"])["elm_merge_time"]   # 200.0
+```
+
+## Anything else: raw SQL
+
+```python
+schema()   # prints every table, column and row count
+
+query_elm_index("""
+    SELECT s.shot, s.signal_used, COUNT(l.label_id) n
+    FROM elm_run_shots s LEFT JOIN elm_labels l
+      ON l.run_id = s.run_id AND l.shot = s.shot
+    WHERE s.run_id = 1 AND s.status = 'labeled'
+    GROUP BY s.shot HAVING n > 3 ORDER BY n DESC LIMIT 5
+""")
+```
+
+Tables: `elm_runs`, `elm_run_shots`, `elm_labels`, `signal_availability`, and
+the view `elm_labels_current` (labels from the default run only).
+
+**SQL trap:** `elm_run_shots` has one row per (run, shot). Joining
+`elm_labels` to it without constraining `run_id` on *both* sides counts every
+label once per run and silently doubles the totals.
+
+The same trap one level down: `elm_labels_current` is the default run of every
+granularity, not a single product. Constrain `granularity` whenever you count,
+sum or average over it.
+
+## Joining to d3drdb
+
+Physics context lives in another schema of the SAME service, so a join is just a
+join -- no attaching, no second connection. Prefer the `d3d-relational-db` skill
+for anything that is purely a d3drdb question.
+
+```python
+from d3d_elm_index import query_elm_index
+
+rows = query_elm_index("""
+    SELECT l.shot, COUNT(*) n_windows,
+           ROUND(SUM(l.end_time - l.start_time)) elmy_ms,
+           ROUND(m.ipmax/1e6, 2) ip_MA, ROUND(m.kappa, 2) kappa
+    FROM elm.elm_labels_current l
+    JOIN d3d.summaries m ON m.shot = l.shot
+    WHERE l.granularity = 'interval'
+    GROUP BY l.shot, m.ipmax, m.kappa ORDER BY elmy_ms DESC LIMIT 5
+""")
+```
+
+**`WHERE l.granularity` is not optional.** `elm_labels_current` carries the
+default run of EVERY granularity -- interval windows AND individual bursts --
+so an unconstrained count mixes the two. On shot 149058 that is 84 "windows"
+and 4039 ms against the true 2 windows and 3595 ms: both plausible, both wrong,
+and nothing in the result says so. Decide which granularity the question means
+and say so in the query.
+
+**Every selected column must be grouped or aggregated.** `m.ipmax` and
+`m.kappa` are per-shot constants, so they look redundant in the GROUP BY -- but
+leaving them out is an error, not a convenience. Add them.
+
+Qualify the schema on both sides: `elm.` for the index, `d3d.` for the shot
+catalogue. `d3d.summaries` is plasma-type shots only, which is what almost every
+physics question means. `d3drdb.summaries` is the untrimmed catalogue -- every
+shot including power-supply tests and calibrations, substantially more rows --
+and is available if a question genuinely wants them, but is not the default and
+never the right denominator for "what fraction of DIII-D shots...". Count both
+sides if the difference matters to the answer.
+
+`d3d.summaries` also has `t_ip_flat` and `ip_flat_duration` (flattop timing),
+which lets an ELM window be placed within the discharge phase.
+
+## Reporting rules
+
+1. State how many shots the answer is based on, and that the index is a
+   subset. "234 of the indexed shots" -- never "234 DIII-D shots". Take the
+   total from `elm_index_info()`, which changes as the index grows.
+2. Give `signal_used` when the answer depends on which diagnostic was read.
+3. Give the granularity and, for interval results, the merge time -- the
+   parameters change what a row means.
+4. Never present a derived rate without its basis (bursts over what duration).
+5. If a question needs a label class no run produces, say so and name what is
+   available -- `label_sets()` shows which run emits which classes. Substituting
+   a different class, or reading one run's class as another's, is the error.
+6. Label every time column `ms` (Rule 7).
+7. **Quote numbers from query output, not from memory.** When giving a worked
+   example or a "sample row", copy it from what the script actually printed. A
+   plausible-looking value written from recollection is the failure mode that
+   survives review, because everything around it is correct.
+8. When a question is about a shot RANGE, get the population size by querying
+   d3drdb rather than assuming -- the count of shot *numbers* in the interval
+   is not the count of shots that exist.

@@ -1,0 +1,765 @@
+---
+name: d3d-shot-fetcher
+description: Fetch plasma data for DIII-D shot numbers — elongation (kappa), poloidal flux (psirz), plasma current (ipmhd), stored energy (wmhd), beta, and other efit01 signals; also PTDATA raw digitizer signals and beam emission spectroscopy (BES) waveforms
+license: Apache-2.0
+compatibility: Designed for deepagents CLI with fdp-d3d
+metadata:
+  author: DeepTok
+  version: "1.3"
+---
+
+# DIII-D Shot Data Fetcher Skill
+
+## Does this signal exist? Ask the catalogue, not the tree
+
+Before opening a tree or fetching anything, check whether the pointname exists
+at all. `find_signals()` searches the catalogue of every archived signal in one
+query -- no MDSplus connection, no shot required:
+
+```python
+from d3d_ptdata import find_signals
+
+find_signals("FS%DA")            # the D-alpha filterscope channels
+find_signals("D2")               # anything with D2 in the name
+find_signals("IP", tree="EFIT01")
+```
+
+**An empty result is an answer.** If nothing matches, the archive has no such
+pointname and an analysis needing it cannot be done -- report that and move on.
+Searching again by another route wastes time and returns the same nothing.
+
+**Before concluding it is absent, list the family.** A family often uses a
+suffix you did not guess, so ask what suffixes exist rather than testing one
+guess at a time:
+
+```python
+sorted({r["name"][4:] or "(bare)" for r in find_signals("FS0%", limit=400)})
+# -> ['(bare)', 'C2', 'C3', 'DA', 'DB', 'DWDA', 'F', 'HE2', 'UP', ...]
+```
+
+That one call tells you which spectral lines the filterscopes actually record,
+which is faster and more reliable than guessing names and fetching each.
+
+## First: `PTSERVER` / `getservbyname` errors mean the wrapper was omitted
+
+If a fetch fails with:
+
+```
+getservbyname failed for task 'PTSERVER' ... not in /etc/services
+```
+
+the script was run in-kernel. **This is not a network outage, an expired token,
+or a service that needs restoring.** Re-run the identical script with
+`fdp run python script.py` -- change nothing else. Never report this error to
+the user as an environment failure, and never ask them to restore connectivity.
+
+This applies on EVERY fetch, including re-runs and re-analysis. A follow-up
+request that re-fetches the same signal to redo an analysis differently is still
+a fetch. Verified twice on live sessions: a run fetched correctly under
+`fdp run`, was asked to redo the measurement, ran the new script in-kernel, hit
+this error, and reported the environment as broken while `fdp run python` was
+working in the same pod at the same moment.
+
+Affects all PTDATA signals, which includes every BES channel (`BESFU*`). Local
+SQLite work and MDSplus tree reads are unaffected -- see the execution-rule
+section below for where the boundary sits.
+
+## First: D-alpha / filterscope / ELM requests go to another skill
+
+If the request mentions D-alpha (Dalpha, D_alpha, Dα), filterscopes, ELM (Edge
+Localized Mode) light, or spectroscopy-tree pointnames, STOP and use the
+`d3d-filterscopes` skill and its `list_dalpha_pointnames()` function. Do NOT
+enumerate the spectroscopy tree yourself. The D-alpha filterscope pointnames are
+the tags ending in `DA` that resolve to `FILTERSCOPE.PMT##:PHOTON_FLUX` — NOT the
+full set of PMT channels (those span many spectral lines: C-II, C-III, He,
+broadband, ...). This skill (below) is for `efit01` and other scalar/profile trees.
+
+## First: "what WAS X for shot Y" (a single number, not a time series) -- check d3d-relational-db first
+
+If the request asks for a single summary value per shot -- "what WAS the
+elongation," "what WAS the peak plasma current" -- rather than "plot ...
+versus time" or "how does X vary during the discharge," check
+`d3d-relational-db`'s `shot_summary()` FIRST, not this skill. It is a single
+lookup against the served catalog (no Pelican/MDSplus fetch needed) and is
+exactly what it is built for -- see its own "SUMMARIES gives ONE scalar per
+shot" note. Only
+fetch the raw MDSplus signal here if `d3d-relational-db` doesn't have the
+file, doesn't cover the specific quantity asked for, or the request
+genuinely wants the full time-resolved trace.
+
+**Worth being precise about what differs, because neither route is wrong.**
+Ask the same question ("what was this shot's elongation and peak plasma
+current") two ways and you get two different, both LEGITIMATE answers: via
+`d3d-relational-db`, one scalar per quantity; via a raw `efit01` fetch here, a
+range across the discharge and an empirical peak that sits a percent or so off
+the database value. `SUMMARIES.ipmax` is a separately computed and stored
+database value, not the same thing as the raw `\ipmhd` trace's own maximum;
+the two agree closely because they describe the same physical event through
+different pipelines, not because either is authoritative over the other. When
+an answer quotes one, say which.
+This rule exists for CONSISTENCY and SPEED (one cheap query beats several
+Pelican fetches and edit-retry cycles for a question this database already
+answers), not because the raw-fetch path was incorrect -- don't frame it that
+way in a final answer either; if both numbers are ever shown together, say
+they're two valid measurements of the same quantity, not that one is right.
+
+## First: charts default to STATIC -- only go interactive if explicitly asked
+
+When a request calls for a plot/chart/show of a signal, default to a static
+image (matplotlib PNG, written to disk and displayed as usual). Do NOT add an
+interactive Plotly chart as unprompted "bonus" value -- even for a signal
+that would look good zoomed in. Only use the `signal-zoom` skill when the
+request itself contains an explicit trigger word: `zoomable`,
+`interactive chart`, `zoom-in chart`, `zoomable view`, `let me zoom in/out`,
+`HighCharts-style`, `HighStock-style`. No trigger word means static, full stop.
+
+**Verified 2026-08-02:** an aggregation-query request ("find the shot with
+the highest peak frequency...") contained no trigger word, yet still got an
+unprompted interactive-chart attempt -- which then failed to render (no
+chart, no error), on top of being the wrong default for that request in the
+first place. Static-by-default avoids both problems: it's cheaper, it always
+renders, and it matches what was actually asked for.
+
+## Execution rule
+
+Every Python script that fetches DIII-D data must be run with:
+
+```
+fdp run python script.py
+```
+
+**Do not hardcode an absolute path to `fdp` or `python`** (e.g.
+`/opt/conda/bin/fdp`) -- verified 2026-08-02: this environment's real
+`fdp`/`python` location varies (`/opt/conda/bin/` in the JupyterHub/Docker
+image, `/usr/local/bin/` on Colab under `condacolab`), and a script hardcoded
+to one breaks on the other with confusing errors (wrong interpreter, missing
+`toksearch`) that cost several debugging turns to diagnose live. Plain
+`fdp run python script.py`, relying on normal `PATH` resolution, has been
+verified end-to-end (real data, correct values) on BOTH environments -- use
+it exactly as written, no absolute paths.
+
+This is the only working invocation shape. All other forms fail silently and
+return 0 shots:
+- `python script.py` — fails (skips fdp's environment setup entirely)
+- `fdp python script.py` — fails (old fdp CLI form; `fdp` is now a subcommand CLI, `run` is required)
+- setting env vars manually and calling python — fails
+
+When writing an execute call, always use `fdp run python script.py`. Never deviate from it.
+
+**Exception -- interactive charts (Plotly / ipywidgets):** only applies when the
+request explicitly asked for one (see "First: charts default to STATIC" above).
+An interactive chart must render in the notebook, so run that script IN-KERNEL
+with plain `python /path/to/script.py` (NOT the fdp wrapper -- fdp is a
+subprocess and cannot render interactive output). In-kernel scripts inherit the
+kernel's Pelican environment, so TokSearch fetches still work. See the
+`signal-zoom` skill. This exception applies ONLY to interactive rendering when
+explicitly requested; every other chart is static and every other data script
+uses the fdp command above.
+
+That in-kernel command must be BARE: an absolute script path with no `cd`, no
+`&&`, no pipes. A command containing any shell operator is NOT routed into the
+kernel -- it runs as a subprocess, where nothing can render, and it exits 0
+looking successful (verified 2026-08-02: `cd <dir> && python plot.py` produced
+no chart, no error, no warning).
+
+### The rule applies to EVERY fetch, including re-runs and re-analysis
+
+`fdp run python` is required each time a script fetches PTDATA -- not only the
+first time in a session. A follow-up request that re-fetches the same signal to
+redo an analysis differently is still a fetch, and still needs the wrapper.
+
+**This has been hit live.** A session fetched BES correctly under `fdp run`
+three times, was then asked to redo the measurement with a different filter, and
+ran the new script in-kernel. It failed with:
+
+```
+ptdata._core.PtDataError: Error opening network connection:
+getservbyname failed for task 'PTSERVER' ... not in /etc/services
+```
+
+**That error means exactly one thing: a PTDATA fetch ran in-kernel.** It is not
+a network outage, not an expired token, and not a service that needs restoring.
+The fix is to re-run the identical script with `fdp run python` -- change
+nothing else. Do not report it to the user as an environment failure, and do not
+ask them to restore connectivity.
+
+**Where the boundary actually sits**, so this is not over-applied:
+
+| work | in-kernel `python` | `fdp run python` |
+|---|---|---|
+| local SQLite (ELM index, d3drdb) | yes -- preferred, no network | unnecessary |
+| MDSplus trees (efit01, spectroscopy, electrons, bes) | works | works |
+| **PTDATA (`PtDataSignal`, incl. all BES `BESFU*`)** | **fails** | **required** |
+| interactive chart rendering | required | cannot render |
+
+So most analysis steps legitimately run in-kernel; it is specifically PTDATA
+that does not. If a re-analysis step needs both an interactive chart and a
+PTDATA fetch, split it: fetch under `fdp run` and save to disk, then render
+in-kernel from the saved file.
+
+## Start from this script -- it is verified and covers every API you need
+
+Copy this and change the signals. It is a real script that was run end to end
+on 2026-08-02 against shot 165920; the output below is its actual output. It
+deliberately fetches BOTH an MDSplus tree signal and a PTDATA signal, because
+mixing up those two APIs is the most common failure in practice.
+
+```python
+"""Canonical DIII-D fetch: MDSplus tree signals AND PTDATA in one script."""
+import numpy as np
+
+# Two DIFFERENT packages -- this is the single most common mistake:
+#   toksearch      -> Pipeline, MdsSignal, ZarrSignal, Signal, MdsTreePath
+#   toksearch_d3d  -> PtDataSignal
+from toksearch import Pipeline, MdsSignal
+from toksearch_d3d import PtDataSignal
+
+
+def create_pipeline(shots):
+    pipe = Pipeline(shots)
+
+    # MDSplus tree signal: expression and tree are POSITIONAL, in that order.
+    pipe.fetch("ip_efit", MdsSignal(r"\ipmhd", "efit01"))
+
+    # PTDATA: different class, and NO tree argument at all.
+    pipe.fetch("ip_ptdata", PtDataSignal("ip"))
+
+    # Drop any record whose fetches errored, before the results loop.
+    @pipe.where
+    def no_errors(rec):
+        return not rec.errors
+
+    return pipe
+
+
+def main():
+    # fetch() mutates the pipeline and returns None -- never chain off it.
+    results = create_pipeline([165920]).compute_serial()
+
+    for rec in results:
+        for name in ("ip_efit", "ip_ptdata"):
+            sig = rec[name]                       # a dict, not a bare array
+            data = np.asarray(sig["data"])
+            times = np.asarray(sig["times"])
+            units = sig["units"]["data"]
+            print(f"shot {rec['shot']} {name}: {data.size} samples, "
+                  f"peak {data.max():.4e} {units}, "
+                  f"t {times[0]:.1f}..{times[-1]:.1f} ms")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Actual output (`fdp run python /abs/path/script.py`):
+```
+shot 165920 ip_efit: 303 samples, peak 1.1299e+06 A, t 100.0..6380.0 ms
+shot 165920 ip_ptdata: 30720 samples, peak 1.1524e+06 amps, t -996.0..14363.5 ms
+```
+
+Note the two sources report units differently (`A` vs `amps`) and disagree on
+peak by ~2% -- expected, they are different diagnostics (see the PTDATA section
+below), not an error.
+
+### Wrong forms that have actually been attempted -- and what they raise
+
+| Wrong | Right | Actual error |
+|---|---|---|
+| `from toksearch import PtDataSignal` | `from toksearch_d3d import PtDataSignal` | `ImportError: cannot import name 'PtDataSignal' from 'toksearch'` |
+| `import toksearch.mds` / `toksearch.signals` | `from toksearch import MdsSignal` | `ModuleNotFoundError` (both; the real submodule is `toksearch.signal`) |
+| `pipe.compute(as_records=True)` | `pipe.compute_serial()` | `TypeError` |
+| `rec.get("errors")` | `rec.errors` | `TypeError: ... missing 1 required positional argument: 'default'` |
+| `rec.has_error("x")` | `"x" in rec.errors` | `AttributeError` -- no such method |
+| `sig.shot()` | shot comes from `rec["shot"]` | `AttributeError` |
+| `sig.fetch(shot).time` / `.data` | `d = sig.fetch(shot)` then `d["times"]`, `d["data"]` | `AttributeError: 'dict' object has no attribute 'time'` |
+| `times * 1e3` "s -> ms" | `times` are ALREADY ms | no error -- silently 1000x wrong |
+| `MdsSignal(expression=..., tree=...)` | `MdsSignal(r"\ipmhd", "efit01")` | wrong kwarg names; the real signature is `MdsSignal(expression, treename, location=None, dims=("times",), ...)` |
+| `MdsSignal(r"\\ipmhd", "efit01")` | `MdsSignal(r"\ipmhd", "efit01")` | `MDSplus.mdsExceptions.TreeINVPATH: %TREE-E-INVPATH, Invalid tree pathname specified` |
+
+## Fetch through a Pipeline, not `Signal.fetch()` directly
+
+`MdsSignal(...)` and `PtDataSignal(...)` both expose a bare `.fetch(shot)`, and
+it does return data -- **a dict**, with keys `data`, `times`, `units` (PTDATA
+adds `n_over`/`n_under`). It is not an object: `.time` and `.data` raise
+`AttributeError`, and the time key is `times`, plural.
+
+Use the Pipeline form anyway:
+
+```python
+p = Pipeline([shot])
+p.fetch("ip", MdsSignal(r"\ipmhd", "efit01"))
+rec = p.compute_serial()[0]
+d, t = rec["ip"]["data"], rec["ip"]["times"]      # t is in MILLIseconds
+```
+
+It is the form every worked example here uses, so error handling, `rec.errors`
+and multi-shot iteration all follow from it.
+
+**Reading MDSplus and PTDATA in the same process is hazardous.** They bring
+separate C libraries, and combining them misbehaves. Measured:
+
+| what the script does | result |
+|---|---|
+| bare `MdsSignal.fetch()` then bare `PtDataSignal.fetch()` | **never returns, no output at all** |
+| bare `PtDataSignal.fetch()` then bare `MdsSignal.fetch()` | prints, then hangs at exit |
+| one `Pipeline` fetching BOTH signals | data always correct; process occasionally aborts at exit AFTER printing |
+| either source alone, any form | fine |
+
+**A comparison of `\ipmhd` against PTDATA `ip` is the request that walks
+straight into this**, so expect it whenever a question asks for both.
+
+Use one `Pipeline` for both signals -- the bare-fetch combination is the one
+that hangs with nothing to show:
+
+```python
+p = Pipeline([shot])
+p.fetch("efit", MdsSignal(r"\ipmhd", "efit01"))
+p.fetch("ptdata", PtDataSignal("ip"))
+rec = p.compute_serial()[0]
+```
+
+That form returned correct data on every run tried. It can still abort at
+teardown with `malloc_consolidate(): unaligned fastbin chunk detected` or
+`double free or corruption (fasttop)` -- roughly one run in seven, always
+*after* the results are printed. So **write results to a file before the script
+ends**, and read a non-zero exit alongside correct output as this teardown
+crash, not a failed fetch.
+
+The fully safe option, when a comparison has to be reliable, is to fetch each
+source in its OWN script and combine the two saved files afterwards: neither
+source alone has ever misbehaved.
+
+The symptom is easy to misread: the cell simply never finishes. It is not a
+slow fetch -- either signal on its own comes back in about a second.
+
+**`times` are milliseconds already.** Every signal in this archive returns a
+time base in ms -- an efit01 trace spans roughly 100 to a few thousand, a PTDATA
+trace starts before zero. Converting with `* 1e3` "s -> ms" produces no error
+and numbers that are 1000x too large, which then read as plausible microsecond
+timings. If a time range looks like millions, that conversion is why.
+
+## Sampling rate: a time INTERVAL in ms is not a frequency in Hz
+
+When reporting a sampling rate, convert -- do not quote the interval as if it
+were a rate. `times` are in MILLIseconds, so for a median interval `dt`:
+
+```python
+dt = np.median(np.diff(times))     # ms
+rate_hz  = 1000.0 / dt             # Hz
+rate_khz = 1.0 / dt                # kHz
+```
+
+Verified 2026-08-03: an answer reported EFIT's cadence as "~20 Hz" from a
+20.0 ms interval. It is **50 Hz**. The same answer's own follow-up cell got it
+right (50.2 Hz), so the two contradicted each other. This is the same slip as
+the filterscope `1e3/dt` mislabel -- worth an explicit check whenever a rate
+is derived from a time base.
+
+**When comparing two sources, derive each cadence from its OWN time base.**
+A raw digitizer trace and an equilibrium reconstruction are sampled orders of
+magnitude apart, and the digitizer also covers a much wider window -- that
+difference is usually the most interesting thing about the comparison, so
+quoting one source's interval for both erases the point. Compute both:
+
+```python
+for name, rec_field in (("ptdata", a), ("efit", b)):
+    t = np.asarray(rec_field["times"])
+    print(name, len(t), "samples,",
+          f"{np.median(np.diff(t)):.3f} ms", f"over {t[0]:.1f}..{t[-1]:.1f} ms")
+```
+
+An answer once described a PTDATA trace as "a high-rate raw trace ... ~20 ms
+cadence" -- the phrase contradicts itself, and 20 ms was the EFIT figure
+carried across. Sample counts and time spans that differ by a large factor
+imply the cadences differ too; if your two numbers come out equal, recheck
+which array each was measured on.
+
+## Data access constraints
+
+Data comes from the Pelican mirror. MDSplus tree paths for ALL DIII-D trees are
+configured at kernel start (or by calling `reload_pelican()`), so many trees
+work -- not just efit01. Verified working:
+- `efit01` -- computed equilibrium (EFIT). Signal current is in Amps (A).
+- `spectroscopy` -- raw diagnostics, including the D-alpha filterscopes used for
+  ELM detection. For those, use the `d3d-filterscopes` skill.
+
+Other trees the environment sets up (the many efit variants, transp, zipfit,
+onetwo, electrons, ...) are generally reachable too -- try them; a failed tree
+shows up as an entry in `rec.errors`, not a crash.
+
+Common `efit01` signals:
+- `\kappa` — plasma elongation
+- `\ipmhd` — plasma current (A)
+- `\betap` — poloidal beta
+- `\betat` — toroidal beta
+- `\q95` — safety factor at 95% flux surface
+- `\wmhd` — plasma stored energy
+- `\psirz` — poloidal flux, 2D (r, z, times), requires dims parameter
+- `\ne` — electron density profile
+- `\t_e` — electron temperature profile
+
+The `fetch_dataset` + `\psirz` anchor pattern below is specific to `efit01`. For
+other trees (e.g. `spectroscopy`), a plain `MdsSignal(expr, tree)` fetch with
+`compute_serial()` works fine -- see the `d3d-filterscopes` skill.
+
+**Plot titles/labels: don't wrap a signal's backslash-prefixed name in
+matplotlib mathtext.** Every signal name in this skill starts with `\` (e.g.
+`\ipmhd`). Putting one inside `$...$` (mathtext, e.g. `f"...($\\{name}$)"`)
+makes matplotlib try to parse it as a LaTeX command and it can crash on a
+malformed one (verified 2026-08-02, cost a live debugging round-trip). Use
+the signal name as plain text in titles/labels -- it doesn't need to render
+as math.
+
+## The `d3d` master tree -- read this before concluding a signal doesn't exist
+
+Most subsystems (IONS, TRANSPORT, MHD, plus a second, DIFFERENT copy of
+SPECTROSCOPY) are NOT standalone MDSplus trees. They are branches nested
+under `TOP` inside a single master tree called `d3d`. Only a handful of
+subsystems ALSO have their own genuine standalone top-level tree -- `efit01`
+and `spectroscopy` are the two verified in this project.
+
+**The mistake this causes (verified 2026-08-01, real case):** asked for shot
+165340's Zeff, a script tried `Tree("IONS", 165340)` -- because d3drdb's own
+`SIGNAL_NAMES.Tree` column literally says `'IONS'` for that signal, and
+`Full_Path` is `\D3D::TOP.IONS.IMPDENS:ZEFF`. Opening a tree named `"IONS"`
+fails (it isn't one), and the script concluded the signal "isn't found" --
+then fell back to a different, transport-code-DERIVED Zeff instead of the
+directly-measured one, and reported the wrong one as "the most complete
+Zeff product available." **The measured signal was fetchable the whole
+time**, just under the wrong tree name:
+
+```python
+from toksearch import MdsSignal
+# WRONG -- "IONS" is a branch label from SIGNAL_NAMES.Tree, not a real tree:
+MdsSignal(r"\zeff", "IONS")        # fails, but does NOT mean the signal is missing
+
+# RIGHT -- open the master tree instead, same short tag:
+MdsSignal(r"\zeff", "d3d")         # SUCCESS -- 294 samples, range 1.37-3.00
+```
+
+**Rule: if `SIGNAL_NAMES.Tree` (or any branch-looking name from a
+`Full_Path` like `\D3D::TOP.<Branch>...`) fails to open as a tree, retry with
+`tree="d3d"` and the SAME short tag (`\` + `SIGNAL_NAMES.Name`) before
+concluding the signal doesn't exist.** Do not silently substitute a
+different, lower-quality, or differently-derived signal (e.g. a transport
+code's modeled value instead of a direct measurement) without both (a)
+actually retrying against `d3d` first, and (b) if a substitution is still
+necessary, saying clearly in the final answer that a different quantity was
+used and why, not that the standard one "isn't found."
+
+**Second, related bug (verified 2026-08-01, same Zeff case, after the fix
+above): don't cite `SIGNAL_NAMES.Full_Path` verbatim as "the signal path" in
+your final answer -- it can be stale.** For this exact case, `d3drdb`'s
+catalog says `Full_Path` = `\D3D::TOP.IONS.IMPDENS:ZEFF` for `ZEFF`, but that
+path does NOT exist (`TreeNNF`, node not found) -- the tag `\zeff` actually
+resolves to a DIFFERENT real node, `\D3D::TOP.SPECTROSCOPY.VB.ZEFF:ZEFF`. The
+fetched DATA was correct (the tag lookup found the right node regardless),
+but a report that quotes the catalog's `Full_Path` string as the source can
+print a path that doesn't even exist. **Rule: when reporting which MDSplus
+node a value came from, call `.getFullPath()` on the node object you actually
+fetched (or that `MdsSignal` resolved) and report THAT string -- never quote
+`SIGNAL_NAMES.Full_Path` (or any other catalog field) as if it were
+independently verified.** The catalog is a hint for what to try, not a
+citation-quality source of truth.
+
+**Third, related bug (verified 2026-08-01): don't state what a signal MEANS
+from its name -- look it up, even when meaning wasn't the question asked.**
+Asked only for `\EFIT01::CPASMA`'s full path, a script correctly resolved the
+path (`\EFIT01::TOP.RESULTS.GEQDSK:CPASMA`) but then volunteered, unprompted,
+that CPASMA is "the plasma cross-sectional area (in m²)" -- wrong. The real
+`d3d-relational-db` catalog entry says `Description: "Plasma current"`,
+`Units: A` -- CPASMA is the same physical quantity as `\ipmhd`, not an area.
+The mistake wasn't caught until a LATER, unrelated question happened to query
+the catalog for a different reason. **Rule: any time an answer states what a
+signal physically represents -- whether that was the actual question or just
+supporting color -- get that meaning from `d3d-relational-db`'s
+`search_signal_catalog()` (or equivalent `SIGNAL_INFO` lookup), never infer it
+from the tag name alone.** Verification discipline applies to everything
+stated in the answer, not only to the part that was explicitly asked for --
+a domain scientist reading the answer can't tell which parts were "the
+question" and which were bonus context, and will trust both equally.
+
+## Code-writing gotchas (verified 2026-08-02, extended 2026-08-11)
+
+- **Write a signal name with exactly ONE backslash inside a raw string:
+  `r"\ipmhd"`.** A raw string already passes the backslash through untouched,
+  so escaping it again produces a two-backslash name, which MDSplus reads as a
+  fully-qualified `\\TREE::NODE` reference with the tree part missing. Verified
+  on shot 165340, both run through `fdp run` in the same container:
+
+  ```
+  MdsSignal(r"\ipmhd", "efit01")    ->  OK, 311 points
+  MdsSignal(r"\\ipmhd", "efit01")   ->  MDSplus.mdsExceptions.TreeINVPATH:
+                                        %TREE-E-INVPATH, Invalid tree pathname specified
+  ```
+
+  **When a fetch raises `TreeINVPATH`, re-read the signal name in the failing
+  `MdsSignal(...)` call before changing anything else** -- a doubled backslash
+  is the cause, and it is invisible unless the name is read character by
+  character. The environment fails with different errors, so INVPATH rules the
+  environment out: a missing Pelican token, a missing `LD_PRELOAD`, or a wrong
+  `<tree>_path` all give `TreeFOPENR`, and an unset or empty `<tree>_path`
+  gives `TreeNOPATH`. All five cases were checked in one container.
+
+  This has been hit live: an agent copied the correct `r"\ipmhd"` line from
+  this file, doubled the backslash while writing it out, then diagnosed the
+  resulting INVPATH as an in-kernel-vs-`fdp run` problem and re-ran the same
+  broken name under `fdp run`. Reading the name would have ended it in one step.
+
+- **Report the fetch error before changing the code that produced it.** Write
+  the pipeline so a failed fetch surfaces `rec.errors`, and read that message,
+  rather than filtering the record out and inferring a cause from the empty
+  result. `@pipe.where(lambda rec: not rec.errors)` drops the errored record,
+  so the run reports "0 records" and the real MDSplus message is never seen --
+  which is how the INVPATH above got misdiagnosed twice in a row.
+
+- **Use raw strings for backslash-prefixed signal names EVERYWHERE, not just
+  inside `MdsSignal(...)`.** A plain (non-raw) docstring or comment like
+  `"""Fetch \kappa and \ipmhd from efit01..."""` triggers a Python
+  `SyntaxWarning: invalid escape sequence` (harmless for `\k`/`\i` here, but
+  the same mistake with a signal name like `\normal` would silently become a
+  newline + "ormal" -- `\n` IS a real escape sequence). Use `r"""..."""` for
+  any docstring/comment/string that contains a signal name, the same way
+  `MdsSignal` arguments already do.
+- **`Record.get()` needs an explicit default argument** -- unlike a plain
+  dict's `.get(key)` (which defaults to `None`), `Record.get(key)` alone can
+  error; always call it as `rec.get(key, None)` (or whatever default fits).
+  This is separate from the `res.errors` vs `res.get("errors")` mistake
+  above -- both are real, both have been hit live.
+
+## Required code pattern
+
+Always use this structure. Deviations (e.g., omitting psirz, using compute_serial) may reduce reliability.
+
+```python
+from toksearch import MdsSignal, Pipeline
+
+def create_pipeline(shots):
+    pipe = Pipeline(shots)
+    dims = ("r", "z", "times")
+    # Always include psirz as a 2D anchor signal
+    psirz_signal = MdsSignal(r"\psirz", "efit01", dims=dims, data_order=["times", "z", "r"])
+    # Add the signals you need
+    kappa_signal = MdsSignal(r"\kappa", "efit01")
+    pipe.fetch_dataset("ds", {"kappa": kappa_signal, "psirz": psirz_signal})
+
+    @pipe.where
+    def no_errors(rec):
+        return not rec.errors
+
+    return pipe
+
+def main():
+    shots = [188702, 191744]
+    pipe = create_pipeline(shots)
+    results = pipe.compute_multiprocessing()
+    print(f"Got {len(results)} shots")
+    for res in results:
+        shot = res['shot']
+        ds = res['ds']
+        kappa = ds['kappa'].values
+        times = ds.coords['times'].values
+        print(f"Shot {shot}: kappa {kappa.min():.3f} - {kappa.max():.3f}, {len(times)} time points")
+
+if __name__ == "__main__":
+    main()
+```
+
+Run this script with:
+```
+fdp run python script.py
+```
+
+Expected output:
+```
+Got 2 shots
+Shot 188702: kappa 1.305 - 1.908, 314 time points
+Shot 191744: kappa 1.426 - 1.950, 254 time points
+```
+
+**Don't re-check for errors inside the `for res in results:` loop -- the
+`@pipe.where` filter above already removed error records, `results` only
+contains clean ones.** If you do add your own extra check anyway, `res` is a
+`Record`-like object, not a plain dict: use `res.errors` (attribute access,
+same as the filter above). `res.get("errors")` fails at runtime -- `Record.get`
+exists but its signature is `get(key, default)` with BOTH arguments required,
+so the usual one-argument dict form raises
+`TypeError: Record.get() missing 1 required positional argument: 'default'`.
+Use `res.errors`, or `res.get("errors", None)` if you really want `.get`
+(verified 2026-08-02).
+
+## Accessing fetched data
+
+```python
+ds = res['ds']
+data = ds['kappa'].values          # numpy array, shape (times,)
+times = ds.coords['times'].values  # time base in ms
+r = ds.coords['r'].values          # radial grid (for 2D signals)
+z = ds.coords['z'].values          # vertical grid (for 2D signals)
+psirz = ds['psirz'].values         # shape (times, z, r)
+```
+
+## Plasma current example
+
+```python
+from toksearch import MdsSignal, Pipeline
+
+def create_pipeline(shots):
+    pipe = Pipeline(shots)
+    dims = ("r", "z", "times")
+    psirz_signal = MdsSignal(r"\psirz", "efit01", dims=dims, data_order=["times", "z", "r"])
+    ip_signal = MdsSignal(r"\ipmhd", "efit01")
+    pipe.fetch_dataset("ds", {"ip": ip_signal, "psirz": psirz_signal})
+
+    @pipe.where
+    def no_errors(rec):
+        return not rec.errors
+
+    return pipe
+
+def main():
+    shots = [188702, 191744]
+    results = create_pipeline(shots).compute_multiprocessing()
+    for res in results:
+        ds = res['ds']
+        ip = ds['ip'].values
+        times = ds.coords['times'].values
+        ip_MA = ip / 1e6  # raw \ipmhd is in AMPERES; divide by 1e6 for MA
+        print(f"Shot {res['shot']}: IP {ip_MA.min():.2f} - {ip_MA.max():.2f} MA (raw signal is A)")
+
+if __name__ == "__main__":
+    main()
+```
+
+Run with:
+```
+fdp run python script.py
+```
+
+## PTDATA access
+
+PTDATA is a SEPARATE data source from the MDSplus trees above -- raw digitizer
+signals (e.g. from the plasma control system / magnetics), not equilibrium
+reconstructions. Different import, different fetch class, no `tree` argument.
+
+```python
+from toksearch import Pipeline
+from toksearch_d3d import PtDataSignal
+
+def create_pipeline(shots):
+    pipe = Pipeline(shots)
+    pipe.fetch("ip", PtDataSignal("ip"))  # no tree arg -- PTDATA is not MDSplus
+
+    @pipe.where
+    def no_errors(rec):
+        return not rec.errors
+
+    return pipe
+
+def main():
+    shots = [165920]
+    results = create_pipeline(shots).compute_serial()
+    for res in results:
+        d = res["ip"]["data"]
+        print(f"Shot {res['shot']}: ip {d.min():.3g} - {d.max():.3g} A, {len(d)} samples")
+
+if __name__ == "__main__":
+    main()
+```
+
+Expected output:
+```
+Shot 165920: ip -2.8e+04 - 1.15e+06 A, 30720 samples
+```
+
+**IMPORTANT -- PTDATA only works via the `fdp run` subprocess pattern above, not
+in-kernel.** Unlike efit01/spectroscopy (which work both in-kernel and via
+`fdp run`), a plain in-kernel `python` fetch of PtDataSignal fails with
+`getservbyname failed for task 'PTSERVER'` -- PTDATA needs `fdp run`'s full
+environment, not just the token/tree-path setup the kernel configures at
+startup. Never attempt PTDATA in an in-kernel/interactive-chart script.
+
+`PtDataSignal("ip")` is a raw digitizer trace and a DIFFERENT diagnostic
+pipeline than `efit01`'s `\ipmhd` (computed equilibrium reconstruction) -- same
+physical quantity, different source, so don't expect identical values between
+the two; report which one you fetched.
+
+## Beam emission spectroscopy (BES) -- 64 channels at 1 MHz
+
+**The `bes` MDSplus tree holds only metadata. The waveforms are in PTDATA**, as
+one pointname per channel: `BESFU01` .. `BESFU64`. Opening the `bes` tree and
+finding fifteen short nodes is not evidence that BES data is missing -- it is
+the expected layout, and the template lives in `\BES::BES_FPN` (`'besfunn'`,
+where `nn` is the zero-padded channel number).
+
+The array is 8x8 in the plasma edge and outboard region, sampled at 1 MHz, so
+it resolves fluctuations to ~500 kHz. `\BES::BES_R` and `\BES::BES_Z` give the
+64 channel positions in cm -- needed to pick which channels sit at the pedestal,
+since that changes between shots.
+
+**Use `fetch_ptdata()` from the `d3d_ptdata` module shipped with this skill.**
+It runs the fetch in a real subprocess, so it works from a notebook cell, from a
+script, from anywhere -- you do not have to think about execution paths:
+
+```python
+import os, sys
+sys.path.insert(0, os.path.expanduser("~/.deepagents/agent/skills/d3d-shot-fetcher"))
+import numpy as np
+from MDSplus import Tree
+from d3d_ptdata import fetch_ptdata
+
+
+def bes_geometry(shot):
+    """(R, Z) in cm for the 64 channels, or (None, None) if not stored."""
+    try:
+        tree = Tree("bes", shot)
+        R = np.asarray(tree.getNode(r"\BES::BES_R").getData().data(), float)
+        Z = np.asarray(tree.getNode(r"\BES::BES_Z").getData().data(), float)
+        return R, Z
+    except Exception:
+        return None, None
+
+
+for SHOT in (166692, 169908):
+    R, Z = bes_geometry(SHOT)
+    if R is None:
+        chans = [32, 40, 48]          # outer column, by convention
+    else:
+        # Rank by MAJOR RADIUS FIRST -- the pedestal is at the outermost radius.
+        # Then, among those, take the ones nearest the midplane. Sorting by |Z|
+        # first picks midplane channels at any radius, which lands ~15 cm inside
+        # the array's outer edge and misses the pedestal entirely.
+        chans = [i + 1 for i in np.argsort(-R)[:16] if abs(Z[i]) < 5][:3]
+    sig = fetch_ptdata(SHOT, [f"BESFU{c:02d}" for c in chans])
+    t = sig[f"BESFU{chans[0]:02d}"]["times"]
+    print(f"shot {SHOT}: channels {chans}, {len(t):,} samples, "
+          f"{t[0]:.0f}-{t[-1]:.0f} ms, {1000.0/np.median(np.diff(t))/1e6:.1f} MHz")
+```
+
+Verified output:
+```
+shot 166692: channels [32, 56, 48], 6,291,456 samples, 500-6791 ms, 1.0 MHz
+shot 169908: channels [32, 48, 40], 5,242,880 samples, 200-5443 ms, 1.0 MHz
+```
+
+**Guard the geometry lookup.** Individual metadata nodes are not populated on
+every shot -- on 169908 `\BES::BES_N` raises `TreeNODATA` while `BES_R` and
+`BES_Z` return normally. Read only the nodes actually needed, and fall back to
+a fixed channel list rather than failing: the waveforms are present in PTDATA
+regardless of what the `bes` tree stores.
+
+**Cost, measured.** One channel is 5-6.3 million samples, about 50 MB as
+float64, and takes ~1.1 s to fetch; four channels take 1.8 s (~0.5 s each).
+All 64 channels is roughly 3.2 GB and about a minute. **Quote this before
+fetching the whole array** -- a request for "the BES data" across several shots
+is tens of gigabytes. Fetch the channels the question needs, and cast to
+float32 on read if the array is being kept in memory.
+
+BES comes through PTDATA, so the `fdp run` execution rule above applies: a
+plain in-kernel fetch fails with `getservbyname failed for task 'PTSERVER'`.
+
+**Choosing channels.** The pedestal sits at large major radius; `R` spans
+roughly 210-230 cm depending on the shot, and the outermost column is the edge.
+Report which channels were used and their `(R, Z)`, because "the BES signal" is
+not one signal and a reader cannot otherwise tell where in the plasma the
+result came from.
