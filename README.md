@@ -163,10 +163,22 @@ disruption half; this works through the disruption half (Q14–Q27) against the
 same index. Some questions are answerable now — which pipeline produced a label
 and at what commit, which quantities are disruption precursors and in what
 units, whether the two disruption indicators agree. Some are answerable for one
-pipeline only, because GA's questions assume three and we have run one. And two
-are answered correctly by refusing: a campaign disruption rate, which this slice
-cannot support, and a question about discharge phase, where the column that
-should answer it is constant for every row because of an upstream unit bug.
+pipeline only, because GA's questions assume three and we have run one. And a
+campaign disruption rate is answered correctly by refusing: twenty shots
+balanced ten and ten is a constructed slice, not a sample.
+
+An Alcator C-Mod index has since been added, built by the same code, and it
+moves the line. The discharge phase at each disruption — which DIII-D cannot
+report, because a programmed current recorded in the wrong unit leaves the
+column meant to answer it constant on every row — C-Mod resolves for all but
+one of its disrupted shots. That same unit error turns out to be what makes two
+identically named columns differ between the machines by a factor of a million.
+Two further questions ask what the machines share, and the more interesting
+answer is that their indexes disagree with themselves in opposite directions:
+on one the indicators dispute whether a shot disrupted, on the other whether
+the data exist. A second device is not a second pipeline, though — both indexes
+come from one release of one code, so agreement between them is evidence about
+the code rather than about the plasma.
 
 [Open the notebook](examples/jupyterhub/argus_feder_disruption_competency_jupyterhub.ipynb)
 
@@ -186,6 +198,24 @@ apparent discriminators that are real physics from those that are artifacts of h
 the disruption label is defined.
 
 [Open the notebook](examples/jupyterhub/argus_feder_disruption_research_jupyterhub.ipynb)
+
+### Loop voltage before a disruption, in Alcator C-Mod
+
+A disrupting plasma cools before it loses its current, and the loop voltage is
+where the rising resistance shows up. Figure 1 of Montes et al, *Nuclear Fusion*
+**59** 096015 (2019) puts that on one panel: loop voltage over the final 250 ms
+before the current quench, for C-Mod shots that disrupted out of flat-top,
+against the flat-top voltage of shots that did not. This notebook rebuilds it
+from a stored C-Mod index, produced by the same MIT-PSFC code as the DIII-D one.
+C-Mod ran its current in both directions, so each shot's voltage has to be signed
+by its own current first — thirty-five of the ninety-four ran reversed.
+
+The second question is about limits. The pre-quench shift is modest, the large
+jump in the final milliseconds is the current already collapsing rather than a
+warning of it, and the index holds the shots its provider published times for,
+so nothing here describes how often C-Mod disrupts.
+
+[Open the notebook](examples/jupyterhub/argus_feder_cmod_vloop_disruption_jupyterhub.ipynb)
 
 ## Plasma-facing materials
 
@@ -239,6 +269,31 @@ in the sample table. And the helium-free controls do not come back helium-free, 
 narrows the contrast the experiment was built around.
 
 [Open the notebook](examples/jupyterhub/argus_feder_materials_helium_jupyterhub.ipynb)
+
+### Does helium in the surface make tungsten hold more deuterium, or less?
+
+Whether a helium layer traps fuel or blocks it decides how much tritium a reactor
+wall keeps, so the sign of the effect matters more than its size. The same coupon
+set answers it, and the answer is not one number: helium at 800 K lowers retention
+under an ELMy H-mode plasma and raises it under L-mode, while helium at 600 K
+raises it under both.
+
+Three further questions test how far that survives. The three techniques do not
+measure the same quantity — they reach different depths and report in different
+representations — so each is read on its own terms rather than pooled or ranked,
+and where they diverge the divergence is itself the result: helium moves
+deuterium toward the surface as much as it changes how much is held, so a
+measurement integrating to a different depth returns a different number. The
+coupons exposed in L-mode retained more deuterium than their H-mode counterparts
+by both areal techniques, in every matched pair, though the two campaigns
+differed in seven recorded conditions, so the effect belongs to the campaigns
+rather than to confinement mode alone. The closing question asks what the set
+collectively supports and what it cannot settle: with one coupon per condition
+the differences belong to these coupons rather than to tungsten, and the coupon
+temperature during exposure — the quantity the retention physics turns on — was
+never measured.
+
+[Open the notebook](examples/jupyterhub/argus_feder_materials_he_effect_jupyterhub.ipynb)
 
 ## Running these notebooks
 
