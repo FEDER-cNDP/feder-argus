@@ -79,6 +79,7 @@ in those terms; there is no local copy to fall back to.
 import os, sys
 sys.path.insert(0, os.path.expanduser("~/.deepagents/agent/skills/d3d-relational-db"))
 from d3d_relational_db import (query_d3drdb, plasma_shots_in_range, shot_summary,
+                               shot_summaries,
                                search_signal_catalog, report_shot_summary, explain_signal)
 ```
 
@@ -93,6 +94,86 @@ query_d3drdb(sql, params=())             # -> list[dict], for anything else
 report_shot_summary(144921, ["gas", "neutrons"])   # -> ANSWER TEXT to quote verbatim
 explain_signal(r"\FS02UPDA")                        # -> ANSWER TEXT to quote verbatim
 ```
+
+## The database is PostgreSQL -- what that changes
+
+The service runs PostgreSQL. A thin compatibility layer at the boundary absorbs
+the SQLite spellings that translate exactly, so these all work as written and
+need no thought:
+
+| you write | why it works |
+|---|---|
+| `?` placeholders | rewritten to `%s` |
+| `LIKE 'FS04%'` | rewritten to `ILIKE`, keeping SQLite's case-insensitive match |
+| `IFNULL(x, 0)` | renamed to `COALESCE` |
+| `ROUND(x, 2)` on a float | an overload is installed for it |
+
+Everything else is PostgreSQL, and these four are the ones that actually cost
+retries. Each was confirmed against the live service:
+
+| this fails | error | write instead |
+|---|---|---|
+| `GROUP_CONCAT(sig, ',')` | `function group_concat(text, unknown) does not exist` | `STRING_AGG(sig, ',')` |
+| a SELECT alias in `HAVING` | `column "n" does not exist` | wrap in a subquery |
+| a SELECT alias in `WHERE` | `column "r" does not exist` | wrap in a subquery |
+| an aggregate in `GROUP BY` | `aggregate functions are not allowed in GROUP BY` | wrap in a subquery |
+
+`GROUP_CONCAT` is not auto-translated on purpose: `STRING_AGG` takes a
+delimiter argument, so a silent rewrite would have to invent one, and a
+rewrite that changes meaning is worse than an error naming the function.
+
+The subquery form covers three of the four:
+
+```sql
+SELECT * FROM (
+  SELECT shot, COUNT(*) AS n FROM signal_availability GROUP BY shot
+) t WHERE n > 1
+```
+
+**Every selected column must be grouped or aggregated.** `SELECT shot, signal,
+COUNT(*) ... GROUP BY shot` fails with `column "signal" must appear in the
+GROUP BY clause`; SQLite would have picked an arbitrary row. Per-shot constants
+look redundant in a `GROUP BY` and still have to be listed.
+
+## Column names come back lowercase
+
+The service returns every column name folded to lower case, whatever case the
+query used. This file writes some names in capitals because that is how the
+d3drdb documentation writes them -- `ZEFF`, `DENSITY_AVG`, `SHOT` -- but the
+row you get back is keyed `zeff`, `density_avg`, `shot`.
+
+`Row` matches keys in any case, so all of these work and agree:
+
+```python
+row["ZEFF"]            # value
+"ZEFF" in row          # True
+row.get("ZEFF")        # value
+"ZEFF" in row.keys()   # True
+list(row.keys())       # the real lowercase names
+```
+
+Iterating gives the real names, so a printed row shows what the database
+actually returned. **Do not conclude a column is missing because a capitalised
+name does not appear in a printed key list** -- check membership instead of
+comparing strings, and remember `SELECT *` returns everything regardless.
+
+## More than one shot? Use the batch call
+
+Every helper here talks to a service over HTTP, so a single-shot helper costs
+one round trip. A loop over a shot list turns one question into hundreds of
+requests -- the difference between a second and several minutes, and the cell
+looks hung while it happens because output is buffered until the script ends.
+
+| one shot | many shots |
+|---|---|
+| `shot_summary(shot)` | `shot_summaries(shots)` -> dict keyed by shot |
+
+Shots with no SUMMARIES row are absent from the result, so test with `in`
+rather than assuming every requested shot comes back.
+
+The single-shot forms are still there and still correct; they are for one shot.
+**If a question mentions a range, a cohort, "which shots", "compare across" or
+any plural, the query should mention them all.**
 
 ## Answer summary questions with `report_shot_summary()`, and quote it
 
@@ -316,6 +397,34 @@ if it just wants "what was the elongation for this shot" as one number,
 `SUMMARIES.kappa` is the right (and much cheaper) answer. Several columns
 carry a paired `t_*` column (e.g. `betanmax`/`t_betanmax`) giving the TIME at
 which that peak/representative value occurred -- report both if asked "when."
+
+## A SUMMARIES scalar carries no unit guarantee -- check it before computing with it
+
+`explain_signal()` gives the unit of a catalogued MDSplus tag. SUMMARIES columns
+are not that catalogue. Several of them hold whatever unit the code that filled
+them used -- a current in amperes beside a power in kilowatts, a density whose
+exponent differs from the corresponding signal's by the cm^-3 to m^-3 factor of
+1e6, <!-- lint-ok: a unit conversion, not a dataset fact --> a column whose name
+suggests one unit while the values are in another.
+
+That is harmless until the column is combined with something else. A Greenwald
+fraction, a radiated fraction, a confinement time each divide one quantity by
+another, and a wrong exponent in either one produces a dimensionless number that
+still reads like a fraction.
+
+**Check an order of magnitude before putting a column into a formula** -- against
+the physics, and against the same quantity fetched through `d3d-shot-fetcher`
+for one shot. If the two disagree by a round factor the column is in another
+unit; if they disagree by an unround factor, or the sign flips, prefer the
+signal and say which you used.
+
+**A SUMMARIES column that was itself DERIVED is a claim, not a measurement.**
+Durations, flat-top windows and "time of" columns were computed by earlier code
+from a trace you can fetch yourself. Wherever the answer depends on that window
+-- anything averaged over a flat-top -- derive the window from the current trace
+and keep the summary column as a cross-check. When the two disagree, say so:
+the disagreement is a finding about the archive, and quoting the column without
+checking hides it.
 
 ## CRITICAL: do NOT use SUMMARIES.t_disrupt (or similar) as a disruption label
 

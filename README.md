@@ -12,7 +12,10 @@ every answer was produced by the agent from the question above it.
 ## What is in this repository
 
     examples/jupyterhub/   the notebooks, saved with the answers the agent gave
+    examples/colab/        Colab variants of a subset of them (see the note below)
     skills/                the knowledge modules the agent uses to reach each data source
+    review_rules.md        the criteria the agent's answers are checked against
+    install.py             installs the skills into a session that has none
     image/                 how the runtime image is built (see image/README.md)
 
 The notebooks are saved with their real outputs, so they can be read without
@@ -31,12 +34,30 @@ from the question alone.
 | `d3d-elm-index` | Stored ELM labels from several detectors and from hand-labelling, with their provenance |
 | `d3d-elm-phase-analysis` | Sorting other measurements by where they fall in the ELM cycle |
 | `d3d-disruption` | Disruption timing and the parameters recorded around it |
+| `cmod-disruption` | The same for Alcator C-Mod, from an index built by the same code |
 | `d3d-filterscopes` | Filterscope diagnostics |
 | `d3d-materials` | Exposed material samples: their treatment history, measurements, and the files behind them |
 | `d3d-imas-terms` | Translation between IMAS names and DIII-D names |
+| `literature` | Published papers, searched and read for passages that bear on a question |
 | `signal-zoom` | Looking closely at a region of a signal |
 
 ## Examples
+
+Each example comes in two forms. The **JupyterHub** notebook is the source: it
+assumes the agent, TokSearch and the DIII-D skills are already installed, as
+they are in the `kaiucsd/argus-feder` image. The **Colab** variant is the same
+notebook plus an install bootstrap.
+
+> **The Colab variants do not currently run.** Google Colab moved its runtime to
+> Python 3.13 and the `ga-fdp` conda channel has no Python 3.13 build of
+> TokSearch yet, so the install step fails. They are kept here for the record
+> until a build is published. The **JupyterHub** notebooks linked below are
+> unaffected.
+
+Both variants ask byte-for-byte identical `%%ask` questions, and both are saved
+with their real outputs.
+
+---
 
 ## Data access and terminology
 
@@ -293,13 +314,22 @@ the differences belong to these coupons rather than to tungsten, and the coupon
 temperature during exposure — the quantity the retention physics turns on — was
 never measured.
 
+This run also reaches outside the sample record, searching the published
+literature and bringing a paper on L–H confinement into the answer.
+
 [Open the notebook](examples/jupyterhub/argus_feder_materials_he_effect_jupyterhub.ipynb)
 
 ## Running these notebooks
 
 The notebooks assume the agent, TokSearch and the DIII-D skills are already
-installed, as they are in the runtime image. Two credentials are supplied at
-run time and are never stored in this repository:
+installed, as they are in the runtime image:
+
+```
+kaiucsd/argus-feder:0.1.19
+```
+
+Two credentials are supplied at run time and are never stored in this
+repository:
 
 - an API key for the LLM provider
 - a DIII-D Pelican access token

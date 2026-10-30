@@ -41,7 +41,7 @@ def _query(sql, params=()):
     return _query_api(sql, params)
 
 
-def working_dir():
+def _resolve_working_dir():
     """The notebook's working folder -- where fetched files belong.
 
     NOT the current directory. A script may be run from anywhere (`python
@@ -65,9 +65,39 @@ def working_dir():
     cwd = os.getcwd()
     if os.path.basename(cwd).endswith("_sage_"):
         return cwd
+    # The running script's OWN directory, checked before the glob below.
+    #
+    # Scripts are written into the working folder and run by absolute path,
+    # which leaves the process in the notebook's folder one level up. argv[0]
+    # then identifies the working folder even when the environment variable did
+    # not survive into the subprocess -- and it names the right one, which the
+    # glob cannot: a directory holding several notebooks holds several `*_sage_`
+    # folders, and that ambiguous case fell through to cwd. Every fetched file
+    # then landed outside the working folder and was swept back, once per run,
+    # so the fault appeared only after a second notebook was run beside the
+    # first.
+    try:
+        argv0 = os.path.dirname(os.path.abspath(sys.argv[0]))
+        if os.path.basename(argv0).endswith("_sage_") and os.path.isdir(argv0):
+            return argv0
+    except Exception:                                            # noqa: BLE001
+        pass
     import glob as _glob
     here = [d for d in _glob.glob(os.path.join(cwd, "*_sage_")) if os.path.isdir(d)]
     return here[0] if len(here) == 1 else cwd
+
+
+def working_dir():
+    """The notebook's working folder, ending in a separator.
+
+    The trailing separator is deliberate. `working_dir() + "name.csv"` is the
+    natural way to build a destination, and without it that lands a sibling of
+    the folder rather than a file inside it -- a stray the sweep then moves
+    back, once for every script that repeats the concatenation. With it the
+    naive form is correct, `working_dir() + "/name.csv"` still resolves, and
+    `os.path.join()` and `os.path.realpath()` are unaffected.
+    """
+    return os.path.join(_resolve_working_dir(), "")
 
 
 def _as_list(x):
@@ -164,6 +194,12 @@ def observations(sample_names=None, quantity=None, method=None, stage=None,
     `quantity`, `method` and `stage` accept a value or a collection; pass what
     `quantities()` reported. `profile` selects depth-resolved rows when True and
     single values when False; None returns both.
+
+    A row carries its value in `value_num` when the quantity is numeric and in
+    `value_text` when it is descriptive. When BOTH are empty the delivery names
+    the measurement and reports no result for it: it was not measured. Report
+    that as not measured. A value of zero is a different statement -- it is a
+    measurement that came back zero -- and only `value_num == 0` says it.
     """
     sql = ["""SELECT s.name AS sample_name, o.stage, o.method, o.quantity, o.qualifier,
                      o.value_num, o.value_std, o.value_text, o.unit,
@@ -188,16 +224,27 @@ def observations(sample_names=None, quantity=None, method=None, stage=None,
 def values_by_sample(sample_names, quantity, method=None, stage=None):
     """One scalar quantity for a GROUP of samples -> {sample: {...}}.
 
-    The shape to compare samples against each other. Samples with no such
-    measurement are absent from the result rather than present with a zero.
+    The shape to compare samples against each other. A sample the delivery
+    never names for this quantity is absent from the result rather than present
+    with a zero.
+
+    A sample that IS present can still carry no value. Each entry has a
+    `measured` flag: True when the delivery reported a result, False when it
+    names the measurement and reports nothing for it. When `measured` is False,
+    `value_num` is None and the sample has no number for this quantity -- say
+    it was not measured, and take no number for it from another method, since
+    a number belongs to the method that produced it. A sample whose `measured`
+    is True and whose `value_num` is 0 is the opposite case: a real measurement
+    that came back zero.
     """
     rows = observations(sample_names, quantity=quantity, method=method,
                         stage=stage, profile=False)
     out = {}
     for r in rows:
-        out.setdefault(r["sample_name"], []).append(
-            {k: r[k] for k in ("method", "stage", "quantity", "qualifier",
-                               "value_num", "value_std", "unit")})
+        entry = {k: r[k] for k in ("method", "stage", "quantity", "qualifier",
+                                   "value_num", "value_std", "unit")}
+        entry["measured"] = r["value_num"] is not None or bool(r.get("value_text"))
+        out.setdefault(r["sample_name"], []).append(entry)
     return {k: (v[0] if len(v) == 1 else v) for k, v in out.items()}
 
 
@@ -1294,7 +1341,26 @@ def fetch_artifact(artifact_id, dest=None):
     # hundreds of megabytes puts a blocking filesystem write on the critical
     # path of every analysis. Several scripts in one session each re-pulling
     # the same files is the normal pattern, so this is the common case.
-    dest = dest or working_dir()
+    # A relative `dest` resolves against the WORKING FOLDER, not the process
+    # cwd. An analysis script runs as a subprocess whose cwd is the notebook
+    # directory -- one level above the working folder -- so `dest="."` used to
+    # drop the file beside the notebook, where the notebook cannot read it back
+    # and the stray-file sweep had to move it after the fact. "Relative" here
+    # means "in the working folder", which is what `dest="."` was asking for.
+    # Mirrors save_figure, which has refused a path outside the folder all
+    # along; there was no reason for a fetch to behave differently.
+    root = os.path.realpath(working_dir())
+    if dest is None:
+        dest = root
+    else:
+        dest = dest if os.path.isabs(dest) else os.path.join(root, dest)
+        full = os.path.realpath(dest)
+        if full != root and not full.startswith(root + os.sep):
+            raise ValueError(
+                "%s is outside the working folder (%s), which is the only "
+                "place the notebook can read a fetched file back from. Pass a "
+                "bare name, or a subfolder of it." % (dest, root))
+        dest = full
     # Identity is the CONTENT, not the name and size.
     #
     # A delivery reuses filenames across samples -- one micrograph name appears
@@ -1363,3 +1429,169 @@ def fetch_artifact(artifact_id, dest=None):
                 "this file needs a valid FDP token: %s" % detail) from None
         raise LakehouseError("HTTP %d fetching %s: %s"
                              % (e.code, artifact_id, detail[:300])) from None
+
+
+def literature_scope(delivery_id=None):
+    """The scope naming this delivery's papers, for the `literature` skill.
+
+    A delivery sometimes arrives with the publications behind it. Those are
+    reached through `literature`, which is deliberately ignorant of what a
+    delivery is -- it addresses everything by a (scope_type, scope_id) pair.
+    This produces that pair, so the two skills meet without either knowing the
+    other's tables:
+
+        import literature as lit
+        lit.get_chunks("why was helium pre-exposure expected to matter",
+                       mat.literature_scope())
+
+    With one delivery loaded the id can be left out. With several, name the one
+    you mean: papers belong to the delivery they arrived with, and a question
+    about one delivery should not read another's references.
+    """
+    if delivery_id is None:
+        rows = deliveries()
+        if len(rows) != 1:
+            raise ValueError(
+                "there are %d deliveries, so the one to read papers for has to "
+                "be named: literature_scope(delivery_id=...). Call deliveries() "
+                "for the list." % len(rows))
+        delivery_id = rows[0]["delivery_id"]
+    return ("materials_delivery", str(delivery_id))
+
+
+# --------------------------------------------------------------------------
+# FEDER ontology -- community names for what this delivery measured
+# --------------------------------------------------------------------------
+# The ontology holds names, not data: every endpoint that would bind a concept
+# to a shot or a measurement is empty today. So it can say that what we call
+# ERDA is `elastic recoil detection analysis`, and nothing more. Used for what
+# it is, that is worth having -- an answer that names the community term is
+# legible to someone who has never seen our column names.
+#
+# The terms looked up are taken from the DATA -- the methods, quantities,
+# materials and stages actually present -- so a delivery bringing a new
+# instrument is looked up without an edit here.
+
+_ONTOLOGY_CACHE = None
+
+
+def _kg_get(path):
+    """GET one ontology path through the lakehouse, which holds the credential.
+
+    The knowledge graph authenticates with Keycloak and issues five-minute
+    tokens; the lakehouse proxies it so that a notebook needs only the FDP
+    token it already has.
+    """
+    import json                                                  # noqa: PLC0415
+    import urllib.error                                          # noqa: PLC0415
+    import urllib.parse                                          # noqa: PLC0415
+    import urllib.request                                        # noqa: PLC0415
+
+    # `_endpoint()` already ends in /FEDER, as the artifact call above relies on.
+    url = _endpoint() + "/kg/proxy?path=" + urllib.parse.quote(path, safe="")
+    headers = {"Accept": "application/json"}
+    tok = _token()
+    if tok:
+        headers["Authorization"] = "Bearer %s" % tok
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")[:200]
+        raise LakehouseError(
+            "the ontology could not be read (HTTP %d): %s" % (e.code, detail)
+        ) from None
+    except Exception as e:                                       # noqa: BLE001
+        raise LakehouseError(
+            "cannot reach the ontology through %s: %s" % (_endpoint(), e)
+        ) from None
+
+
+def ontology_search(term, limit=5):
+    """FEDER ontology concepts matching a term. Each has an id, label and iri.
+
+    Matching upstream is over labels and synonyms and requires every word to
+    hit, so a compact code finds nothing where its expansion would: search the
+    words a person would say.
+    """
+    import urllib.parse                                          # noqa: PLC0415
+    hits = _kg_get("ontology/search?limit=%d&q=%s"
+                   % (limit, urllib.parse.quote(str(term))))
+    return hits if isinstance(hits, list) else []
+
+
+def load_mvp_ontology(refresh=False):
+    """Align this delivery's own terms with the FEDER ontology.
+
+    Returns one row per term that the ontology recognises, with:
+
+        term     what our data calls it, and where that came from
+        source   'method', 'quantity', 'material' or 'stage'
+        match    'exact'   -- the concept answers to our term itself, as a
+                             label or a skos:altLabel. Safe to state.
+                 'partial' -- the search reached it, but it is named
+                             differently. A candidate for a human to accept,
+                             NOT an equivalence to assert.
+        label, concept_id, iri   the concept
+
+    An exact match is the useful kind: the ontology carries `ERDA` and `NRA` as
+    alternate labels, and `W` for tungsten, so those align with no judgment
+    call. Terms with no row here simply have no concept -- that is a fact about
+    the ontology's coverage, not a failure, and it is worth reporting as such.
+    """
+    global _ONTOLOGY_CACHE
+    if _ONTOLOGY_CACHE is not None and not refresh:
+        return _ONTOLOGY_CACHE
+
+    wanted = []
+    seen = set()
+    for row in quantities():
+        for source in ("method", "quantity", "stage"):
+            value = row.get(source)
+            if value and (source, value) not in seen:
+                seen.add((source, value))
+                wanted.append((source, value))
+    for row in samples():
+        value = row.get("material")
+        if value and ("material", value) not in seen:
+            seen.add(("material", value))
+            wanted.append(("material", value))
+
+    out = []
+    failed = 0
+    for source, term in wanted:
+        try:
+            hits = ontology_search(term, limit=5)
+        except LakehouseError as e:
+            # One failed lookup must not lose the alignments already found. All
+            # of them failing is a different thing entirely: returning an empty
+            # list would read as "the ontology covers none of these terms",
+            # which is a conclusion about the ontology drawn from an outage.
+            failed += 1
+            if failed == len(wanted):
+                raise LakehouseError(
+                    "no term could be looked up, so nothing here says anything "
+                    "about what the ontology covers: %s" % e) from None
+            continue
+        found = []
+        for hit in hits:
+            names = {str(n).strip().lower()
+                     for n in (hit.get("synonyms") or []) + [hit.get("label")] if n}
+            found.append({
+                "term": term,
+                "source": source,
+                "match": "exact" if str(term).strip().lower() in names else "partial",
+                "label": hit.get("label"),
+                "concept_id": hit.get("id"),
+                "iri": hit.get("iri"),
+            })
+        # A broad term reaches five differently-named concepts, none of which it
+        # IS -- five rows of noise inviting the reader to pick one and call it
+        # an equivalence. Keep every exact match, or else the search's own best
+        # candidate and nothing behind it.
+        exact = [f for f in found if f["match"] == "exact"]
+        out.extend(exact if exact else found[:1])
+    out.sort(key=lambda r: (r["match"] != "exact", r["source"], r["term"]))
+    _ONTOLOGY_CACHE = out
+    return out

@@ -17,6 +17,75 @@ import sys; sys.path.insert(0, "/path/to/this/skill/directory")
 import d3d_materials as mat
 ```
 
+## Open the report with the answer
+
+**The report's first line is the answer itself, in two or three sentences,**
+before any table, method note or caveat. A reader who stops after that opening
+should still have the finding, its direction, and roughly its size.
+
+Nothing precedes it. A line reporting that the analysis finished, that the
+files are written, or that the report follows, describes the work rather than
+the result, and the reader can see for themselves that a report arrived.
+
+Give it a short bold lead-in -- `**Short answer**`, `**Bottom line**` -- so the
+eye finds it without reading for it.
+
+Write it to be taken in at a glance: two or three plain sentences, each making
+one point. A single sentence carrying four clauses, three parenthetical numbers
+and a pair of dashes is a paragraph wearing a summary's clothes -- it satisfies
+the instruction and defeats its purpose. Keep the supporting figures for the
+sections below, where there is room to attribute them.
+
+Everything after it is what earns it: the numbers, where they came from, what
+they rest on, what they do not establish. Put a qualification after the claim it
+qualifies rather than ahead of it -- a report that opens with its caveats has
+told the reader nothing yet, and the reader most likely to stop early is the one
+who most needs the finding.
+
+The opening is a summary, not a substitute. The full report follows it.
+
+## A statistic you computed carries its definition
+
+Where the answer reports a number the delivery does not contain -- a texture
+statistic derived from an image, an integral over a profile, a ratio, a
+propagated uncertainty -- give in one line how it was computed and which
+direction means more of the thing being described.
+
+The reader is checking the work, not taking it on trust. A named statistic with
+no definition cannot be reproduced, cannot be compared against their own, and
+cannot be argued with; it reads as authoritative precisely where it is least
+checkable.
+
+## One form for a comparison, and one name for it
+
+A comparison between two measured values can be written as a ratio or as a
+percentage change. **Choose one form and use it for every comparison in the
+answer.** Printing both -- `1.111` beside `+11.1%` -- states the same number
+twice and invites the reader to hunt for the difference between them.
+
+Then one form gets one name, in the prose, in the table headers and in the
+figure captions alike. Where the same idea is headed a ratio in one table, a
+change in the next and an effect in the text, a reader has to work out that the
+three are one thing before they can read any of them, and the natural reading
+is that they are not.
+
+Pick the name from what the number IS, use it where the quantity is first
+reported, and do not vary it for the sake of the sentence.
+
+## Give a method or a material the field's name once
+
+Where the report first names a characterization method, or the material the
+samples are made of, put the community term beside our own. Write our term with
+the community term after it, at first mention only, and carry on with ours
+afterwards so the prose stays readable.
+
+`mat.load_mvp_ontology()` returns the community concept for each term this
+delivery uses; a row marked `exact` is our own term and that concept naming one
+thing two ways, which is what makes it safe to print. A reader who knows a
+technique only by its full name and a reader who knows only the abbreviation
+then both find their footing, without either having to work out that the two
+are the same.
+
 ## Measured quantities are rows, not columns. Discover them first.
 
 There is no column named for a physical quantity. Everything measured lives in
@@ -36,6 +105,292 @@ depth-resolved; read it with `profiles()` rather than `values_by_sample()`.
 
 `mat.samples()` lists the samples and `mat.deliveries()` says where they came
 from and when.
+
+## Name what the delivery measured as the FEDER ontology names it
+
+`mat.load_mvp_ontology()` returns the community concept for each term this
+delivery uses -- its methods, quantities, materials and stages -- read live
+from the FEDER knowledge graph, so the list follows the data rather than a list
+kept here.
+
+```python
+for c in mat.load_mvp_ontology():
+    print(c["match"], c["source"], c["term"], "->", c["label"], c["iri"])
+```
+
+When an answer names a method or a material, give the ontology's term beside
+ours for every row marked `exact`: that concept answers to our own term, as a
+label or an alternate label, so the two are one thing under two names. Treat a
+row marked `partial` as a suggestion for a reader to judge, never as an
+equivalence to state.
+
+When a term has no row, it has no concept in the ontology. Report that plainly
+where it is relevant rather than reaching for an approximate concept -- what
+the ontology does and does not cover is itself worth knowing.
+
+## A question about a quantity is a question about every method that measured it
+
+When the question compares techniques, asks how a quantity was measured, or
+asks how much to trust the answer, list the methods carrying that quantity
+first and report every one of them:
+
+```python
+qs = mat.quantities()
+methods = sorted({q["method"] for q in qs
+                  if q["quantity"] == chosen_quantity and q["method"]})
+```
+
+The methods are DATA. A delivery may carry one, or several that disagree, and
+where they disagree that is usually the finding. Answering from the first
+method that returns a number drops the rest silently, and the reader cannot
+tell anything was left out.
+
+A depth-resolved method is the one that disappears without a trace, because
+`values_by_sample()` asks only for scalar rows. Run against the deployed
+lakehouse, on a quantity two methods report:
+
+```python
+mat.values_by_sample(names, quantity=q, method=scalar_method)  # 9 samples
+mat.values_by_sample(names, quantity=q, method=profile_method) # {}
+mat.profiles(names,         quantity=q, method=profile_method) # 9 samples, 90 points
+```
+
+An empty result there means "not scalar", never "not measured". When a method
+appears in `quantities()` and `values_by_sample()` returns nothing for it, read
+it with `profiles()` before concluding the delivery has no data.
+
+## Take the values from the delivery in the run that reports them
+
+A question about measured values, or about the measurements themselves, is
+answered by querying the delivery in this run -- `observations()`, `profiles()`,
+`values_by_sample()`, `exposure_conditions()` -- and reporting what those calls
+return.
+
+An earlier answer in the same notebook usually leaves its extracted tables and
+excerpt files in the working folder. Read them to cross-check what you
+computed, and say so where they agree.
+
+A quotation that reaches the answer through one of those files carries that
+file's name as its source. The delivered document is what `documents()` and
+`document_text()` return; a file an earlier run wrote is a copy of it, so
+attributing the copy's wording to the document reports a reading that did not
+happen in this run.
+
+## An answer that compares methods carries what the delivery says about comparing them
+
+Where the answer weighs two or more methods against each other, read the
+delivery's `notes` and give its own guidance on whether those methods are
+comparable, in the answer. Where the delivery records no such guidance, say
+that none is recorded.
+
+State an ordering only where a tool result carries one. An ordering that
+follows from the reported uncertainties is a property of those uncertainties:
+name them and give their values, so the reader sees what the ordering rests on
+rather than a verdict on the instruments.
+
+## Put the question to the attached papers, every time
+
+A delivery often arrives with the publications behind it. **Search them at the
+start of every answer, whatever the question looks like:**
+
+```python
+import literature as lit
+scope = mat.literature_scope()
+hits = lit.get_chunks("the question, in ordinary words", scope)
+```
+
+Judging in advance whether a question "needs" the papers is a decision made
+before looking, and it is wrong often enough to matter. A question like "how
+does X affect Y" reads as a pure data question and is usually also a mechanism
+question. A question about what the measurements cannot settle, or what would
+be needed to go further, reads as a question about this delivery and is usually
+a question about published practice: naming a technique that would resolve it
+is a claim about what others have done. One search costs a single request.
+Guessing wrong costs a sentence the reader has no way to check, and an answer
+that explains *why* from the model's own knowledge is unsourced however
+plausible it sounds -- which is exactly what these papers are here to replace.
+
+What comes back is ranked, not filtered. The search returns its best passages
+whether or not the papers address the question at all, so read them before
+using them: the `literature` skill covers telling a passage that answers the
+question from one that merely shares its subject. Finding nothing that bears on
+the question is a normal outcome, and the answer says nothing about the
+literature in that case.
+
+`lit.works(scope)` lists what is attached. `NoLiteratureForScope` means this
+delivery has no papers catalogued -- a fact about the catalogue, not about the
+literature.
+
+### A comparison between conditions has two literatures: search for both
+
+A question of the form "how does this quantity differ between one condition and
+another" carries two bodies of work behind it. One is about the quantity and how
+it is measured. The other is about the conditions themselves -- what they are,
+what distinguishes them, and what else changes when one is chosen over the
+other.
+
+A single search phrased around the quantity returns only the first, because that
+is what it asked for. So search a second time for the conditions themselves,
+named the way a reader of that field would name them rather than the way the
+data labels them:
+
+```python
+hits = lit.get_chunks("the quantity, in ordinary words", scope)
+more = lit.get_chunks("what distinguishes these conditions from each other", scope)
+```
+
+The second search is what tells you whether the differences recorded between two
+conditions are independent of one another or are consequences of a single
+underlying change. That distinction decides what the comparison can support, so
+it belongs in the answer whether the papers settle it or not.
+
+Write what that second search found into the answer itself, in a sentence that
+names the paper it came from and says what it does not settle about this
+delivery. A paper reaching the reference list without reaching the prose reads
+as one the answer drew on, and an answer that drew on nothing from it should not
+list it.
+
+## A paper that shaped the answer is cited twice
+
+Name it in the sentence that uses it, so the reader knows whose result they are
+reading. Then **close the report with a section of its own listing every paper
+the answer drew on**, headed `## References`.
+
+Give each one the citation exactly as `get_chunks` returned it in `citation`.
+The server assembles that from the catalogue, complete with the identifier that
+takes a reader to the paper. Shortening it to an author and a year leaves them
+searching for something you already had in hand, and retyping a volume or a
+year is how a citation that looks right stops being right.
+
+A report that drew on no paper has no such section and says nothing about it.
+
+## Check the delivery's own evidence for what the treatment did
+
+**A question about what a treatment did to a material is a question about what
+the delivery recorded that would show it** -- a structure that formed, a layer
+that altered, a surface that changed. Make checking for that evidence a step of
+the work, alongside pulling the measurements, rather than something to reach for
+only if an explanation later calls for it. A mechanism taken from a paper
+explains somebody else's samples. Whether these samples show it is a different
+question, and often an answerable one.
+
+What would show a mechanism is usually recorded as files rather than rows, so
+it has no entry in `observations` and nothing in the measurement tables points
+at it:
+
+```python
+kinds = sorted({a["kind"] for a in mat.artifacts() if a["kind"]})
+```
+
+`kind` is None on a file the provider filed under no stage; guard the
+comprehension or it raises. **Images** below covers comparing them at one
+magnification, reading their acquisition settings, and measuring them -- an
+image is measurable even though it cannot be read, so a surface can be
+characterised quantitatively rather than described from memory.
+
+Then say what the record shows, or say that the delivery recorded nothing that
+would show it. Both of those are answers. Explaining a result by a mechanism
+while leaving the delivery's own evidence for it unexamined is not.
+
+### Show the images when they document the step the question asks about
+
+**An image records a state at one moment in the sample's life.** It is evidence
+about what happened before it, and evidence about nothing that happened after.
+That decides whether it belongs in the answer:
+
+- The question asks about the effect of a step that **precedes** the imaging —
+  the pictures are direct evidence for it. **Show them.** This is not optional
+  and not conditional on whether the numbers already answer the question; a
+  reader asking what a treatment did to a material expects to see the material.
+- The question asks about a step that **follows** the imaging — the pictures
+  look the same whichever way that later step went, so they are not evidence
+  about it. Leave them out.
+- The question asks which instrument produced a number, or how two instruments
+  compare — leave them out.
+
+`artifacts()` gives each file's `kind` and `quantities()` gives each
+measurement's `stage`, so the order of the sample's life is recoverable. Place
+the imaging in that order before deciding, and check which samples carry
+images: a delivery often images the ones that stopped partway through the life
+and not the ones that went all the way.
+
+Those images still document the treatment those samples did receive -- the same
+treatment the ones that went further also received -- so where the question is
+about that treatment, show them, even though nothing was imaged after the later
+steps. Ask which step the imaging followed, not whether images exist at the end.
+
+Where the pictures do belong, finish the job:
+
+```python
+imgs = mat.image_artifacts(names)        # one request, near-duplicates dropped
+
+by = {}                                   # settings -> {sample: artifact}
+for a in imgs:
+    md  = a["metadata"]                   # keys are whatever the instrument wrote
+    key = (md.get("CM_MAG"), md.get("CM_ACCEL_VOLT"))
+    if all(key):
+        by.setdefault(key, {}).setdefault(a["sample_name"], a)
+
+key  = max(by, key=lambda k: (len(by[k]), int(k[0])))  # most samples, then most detail
+pick = list(by[key].values())             # one image per sample, same settings
+mat.show_images([a["artifact_id"] for a in pick],
+                labels=[a["sample_name"] for a in pick],
+                title="surface comparison at %sx, %s kV" % key)
+```
+
+**Match on every setting that changes how a surface looks, not magnification
+alone.** Accelerating voltage changes contrast and how deep the beam samples,
+so two images at one magnification and two voltages are not a comparison
+either. Group by the whole tuple.
+
+**Load only the images you are going to show or measure.** The listing already
+carries the metadata the choice needs, so choosing costs nothing, while every
+`load_image` is a fetch.
+
+Measure the chosen surfaces rather than describing them: compute one comparable
+statistic across them and report it beside the figure, with the instrument,
+voltage and magnification from the metadata. Where a conclusion rests on that
+statistic, measure every image at the chosen settings and report the spread --
+a difference taken from one image per sample can reverse on a different choice.
+
+Say which stage of the sample's life the images record, and whether any later
+stage is imaged. Where none is, a change across that step cannot be assessed
+from pictures.
+
+**Then choose the settings the MOST samples share.** Two opposite traps sit
+here and both produce a figure that reads as a comparison:
+
+- Taking the first image's settings picks whatever sorts first, which may be a
+  combination only one sample has -- a one-picture comparison.
+- Fixing on one parameter and letting another vary silently drops any sample
+  that used a different value for it. That is the worse of the two, because
+  the figure still shows several samples and looks complete, while the sample
+  most relevant to the question may be the one missing.
+
+Ranking by how many samples carry each full combination avoids both. Where
+several combinations tie, prefer the higher magnification -- more surface
+structure is visible.
+
+**Say how many samples are imaged.** A delivery commonly images a few of its
+coupons and not the rest, so the figure covers a subset — name it rather than
+letting the reader assume every sample is shown.
+
+Then, in the answer:
+
+- **Name the stage they document.** An image filed under a pre-exposure stage
+  records the state going INTO the exposure; saying otherwise inverts the
+  experiment.
+- **Give the acquisition settings** -- instrument, voltage, magnification --
+  from the companion metadata, so the comparison is citable.
+- **Say what differs between them, from measurement rather than from memory.**
+  An image is measurable even though it cannot be read: load it and compute
+  something -- a mean gradient, a characteristic feature scale from a power
+  spectrum -- and report the number beside the picture.
+
+Where they cannot be compared -- no magnification shared across samples, or
+only one sample imaged -- say so, and say what was there instead. The one
+outcome that is not acceptable is an answer that discusses a surface while the
+delivery's pictures of that surface go unshown.
 
 ## More than one sample? Use the batch call.
 
@@ -119,6 +474,17 @@ one line and either confirms the phrase or replaces it. When the computed
 value turns out not to support the point the sentence was making, the point
 goes with it -- a supporting clause that is merely rephrased to match the
 arithmetic is no longer supporting anything.
+
+## Comparing two recorded conditions: give the design with the numbers
+
+Where an answer compares two sets of conditions a delivery records, give what
+was **intended** -- from the design document delivered with the samples, named
+-- beside what was **recorded**, with the sizes of the differences. A difference
+between two campaigns is not a difference attributable to the one variable their
+names suggest.
+
+Where the delivery records no judgement about whether those differences are
+large or small, supply none.
 
 ## An exposure is a shared campaign
 
@@ -204,6 +570,28 @@ they derived them from: micrographs of the surfaces, instrument exports of the
 plasma conditions, analysis spreadsheets. A question about what a surface looks
 like, or about how a recorded number was arrived at, is answered from the files
 and cannot be answered from the tables.
+
+**Read the provider's own guidance before answering.** A provider knows things
+about their delivery that the delivery does not say: which sheet supersedes
+which, which columns they have withdrawn, what an empty cell means, how far to
+trust each instrument. It travels with the delivery, in `notes`:
+
+```python
+for d in mat.deliveries():
+    if d["notes"]:
+        print(d["delivery_id"], d["notes"])
+```
+
+Read it at the start, not only before opening a file -- some of what a provider
+records cannot be derived from the tables at all, and an answer built without it
+can be arithmetically right and still weight the evidence wrongly. Follow it
+over what a file appears to contain. It is also the answer to a disagreement
+between a file and the tables: the tables were loaded with it applied, so a
+difference is usually a superseded value rather than a finding, and a reader
+does not need to be told about it.
+
+`notes` is null for a delivery whose provider sent no guidance, which is
+ordinary and needs no remark.
 
 **A value the tables already hold, take from the tables.** An observation row
 carries its own `unit`, so the number and its unit travel together. A
@@ -332,6 +720,13 @@ MP_W_erosion_retention_2020_v9.pdf L174  ... resolution to resolve intra-ELM ...
 
 `documents()` lists what will be searched; `document_text()` returns one
 document in full once a hit looks worth following.
+
+Extension is not a barrier: these parse in the tool process, so a `.pdf`,
+`.xlsx` or `.docx` is readable here even where the plain file-read tool refuses
+it.
+
+Where an answer rests on the documents, say what each one contributed, or that
+it contributed nothing.
 
 **A search returning nothing is a result.** If a configuration detail is not in
 any document, it is not recoverable, and an analysis that depends on it should
@@ -604,3 +999,60 @@ distinction the provider made within one quantity, such as a depth band.
 
 A sample with no row for a quantity was not measured for it. That is not a
 zero, and a missing row must never be reported as one.
+
+**A row can also be present and carry no value, and that is the same
+statement.** `values_by_sample()` sets `measured` to False on such an entry
+and leaves `value_num` as None; `observations()` shows it as a row whose
+`value_num` and `value_text` are both empty. It means the delivery names the
+measurement and reports no result for it -- the provider listed the
+measurement and then did not make it, or withdrew it. Write "not measured"
+for that sample and method, and leave it out of any ratio, mean or total.
+
+Read None as the absence of a number, not as the number zero. The distinction
+is the whole content of a reference sample: a coupon that reads a measured
+zero is evidence that the species arrived during the exposure, while a coupon
+that was never measured is evidence of nothing, and a sentence that turns the
+second into the first states as established the very thing it was supposed to
+demonstrate. Check `measured` before writing a number into a sentence:
+
+```python
+v = mat.values_by_sample(names, quantity=q, method=m)
+for n in names:
+    e = v.get(n)
+    if e is None:
+        print(n, "no row -- not measured")
+    elif not e["measured"]:
+        print(n, "row present, no value -- not measured")
+    else:
+        print(n, e["value_num"], e["unit"])
+```
+
+**A number belongs to the method that produced it.** Where the method you
+asked for reports nothing, report that method as not measured and name the
+other method separately with its own value. Substituting a second method's
+number under the first method's name states a measurement that was never
+made, and it is the reader who knows the instruments who will catch it.
+
+## The papers this delivery came with
+
+A delivery sometimes arrives with the publications behind it: the references
+its proposal cites, the method papers it depends on. They are reached through
+the `literature` skill, which knows nothing about deliveries and addresses
+everything by a scope. This produces that scope:
+
+```python
+import literature as lit
+
+scope = mat.literature_scope()          # names this delivery's papers
+lit.works(scope)                        # what came with it
+lit.get_chunks("why was this expected to matter", scope)
+```
+
+Use it when a question asks WHY an experiment was designed a certain way, what
+a cited paper actually found, or how a result sits against published work.
+
+**The boundary is worth stating in the answer.** Every measurement comes from
+here -- the samples, the exposures, the observations. A paper reports somebody
+else's experiment, in their machine, on their material. It explains and it
+contextualises; it is not evidence about these samples, and a sentence that
+does not say whose result it is invites the reader to assume the wrong one.

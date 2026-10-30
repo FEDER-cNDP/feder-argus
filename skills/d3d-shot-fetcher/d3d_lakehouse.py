@@ -104,16 +104,33 @@ def bearer_token():
     An expired env token now steps aside for a valid file token; a valid one
     still wins outright, so an explicit override behaves as before.
     """
+    # Two passes, not one. An undecodable token is still trusted -- this cannot
+    # judge it, and refusing would break any non-JWT token the service accepts
+    # -- but it no longer WINS over a token that demonstrably decodes and is
+    # still valid. First-match-wins meant a five-character placeholder left in
+    # an earlier variable shadowed a good JWT in a later one, presenting as an
+    # authentication failure with a valid token already in the environment.
+    # This is the same "best candidate, not first candidate" rule the file
+    # handling below has always used.
+    #
+    # Order within each pass is preserved, so an explicit override in the
+    # earliest variable still wins whenever it is usable.
+    undecodable = None
     for var in _TOKEN_ENV:
         v = os.environ.get(var)
-        if v and v.strip():
-            v = v.strip()
-            exp = _expiry(v)
-            # Undecodable expiry -> trust it, as before: this cannot judge it,
-            # and refusing would break any non-JWT token the service accepts.
-            if exp is None or exp > time.time():
-                return v
+        if not (v and v.strip()):
+            continue
+        v = v.strip()
+        exp = _expiry(v)
+        if exp is None:
+            if undecodable is None:
+                undecodable = v
+        elif exp > time.time():
+            return v
+        else:
             _EXPIRED_ENV.append(var)
+    if undecodable is not None:
+        return undecodable
 
     found = []
     for path in _TOKEN_FILES:
@@ -242,15 +259,23 @@ def _post(path, payload):
             pass
         if e.code == 401:
             if _EXPIRED_ENV:
+                # Name the action that works WITHOUT a terminal first. A
+                # notebook user cannot run `fdp login`: it shells out to
+                # pelican, which requires a TTY the kernel does not have. The
+                # %fdp_login magic speaks to the issuer over HTTP instead, and
+                # installs the token in every location this client reads.
                 raise LakehouseError(
                     f"the lakehouse rejected this request. "
                     f"{', '.join(_EXPIRED_ENV)} holds an EXPIRED token and was "
                     f"skipped; no valid token was found in "
-                    f"{', '.join(_TOKEN_FILES)} either. On JupyterHub "
-                    f"BEARER_TOKEN is set at kernel start from ~/.fdp/token, so "
-                    f"refresh that file and restart the kernel (or call "
-                    f"reload_pelican()) -- setting the file alone leaves the "
-                    f"stale value in the environment.") from None
+                    f"{', '.join(_TOKEN_FILES)} either. "
+                    f"To get a new token, run %fdp_login in a notebook cell: it "
+                    f"installs the token everywhere this client looks and "
+                    f"refreshes the kernel, so nothing else is needed. From a "
+                    f"terminal instead, run `fdp login -D d3d` and then "
+                    f"reload_pelican() in the kernel -- BEARER_TOKEN is set at "
+                    f"kernel start, so writing the file alone leaves the stale "
+                    f"value in the environment.") from None
             if _UNREADABLE:
                 raise LakehouseError(
                     f"the lakehouse rejected this request, and a token file "
@@ -258,8 +283,10 @@ def _post(path, payload):
                     f"Check its owner and mode.") from None
             raise LakehouseError(
                 "the lakehouse requires a valid FDP token and this one was not "
-                f"accepted: {detail}. Renew it (the same token used for DIII-D "
-                "data access through Pelican) and retry.") from None
+                f"accepted: {detail}. Get a new one with %fdp_login in a "
+                "notebook cell (or `fdp login -D d3d` from a terminal, then "
+                "reload_pelican()). It is the same token used for DIII-D data "
+                "access through Pelican.") from None
         if e.code == 403:
             raise LakehouseError(
                 f"this data needs a valid FDP token: {detail}") from None
