@@ -1,0 +1,19 @@
+# The image needs ~2 MB of this repo: the Dockerfile's seven COPY sources.
+# Everything else is documentation, notebooks and git history, and sending it
+# to the daemon on every build costs time and CI disk for nothing. Without
+# this file the context is the whole repo.
+#
+# Deny everything, then re-admit exactly what Dockerfile.argus copies.
+*
+!skills/
+!scripts/apply_sage_patch.py
+!scripts/sage_magic.py
+!scripts/sage_kernel_backend.py
+!scripts/deeptok_pelican.py
+!feder/lakehouse_api/tests/pod_preflight.py
+!review_rules.md
+
+# Re-admitting a directory re-admits its junk too.
+**/__pycache__/
+**/*.pyc
+**/.DS_Store

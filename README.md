@@ -16,6 +16,9 @@ every answer was produced by the agent from the question above it.
     skills/                the knowledge modules the agent uses to reach each data source
     review_rules.md        the criteria the agent's answers are checked against
     install.py             installs the skills into a session that has none
+    scripts/               the Dockerfile, the build script, and the runtime files
+                           the image installs into the kernel
+    feder/                 the pod preflight check
     image/                 how the runtime image is built (see image/README.md)
 
 The notebooks are saved with their real outputs, so they can be read without
@@ -26,6 +29,10 @@ running anything.
 A skill is what teaches the agent one data source: where it lives, how it is
 shaped, and what is easy to get wrong about it. The agent chooses which to use
 from the question alone.
+
+The last rows are supporting skills: the TokSearch ones document the API the
+data skills are written against, and the MAST ones are reached through the
+device rather than asked for by name.
 
 | Skill | What it covers |
 |---|---|
@@ -40,6 +47,15 @@ from the question alone.
 | `d3d-imas-terms` | Translation between IMAS names and DIII-D names |
 | `literature` | Published papers, searched and read for passages that bear on a question |
 | `signal-zoom` | Looking closely at a region of a signal |
+| `d3d-disruption-compute` | Computing disruption parameters with disruption-py for shots the stored index does not cover |
+| `cmf-provenance` | Which code, parameters and inputs produced a result, read from the CMF metadata server |
+| `toksearch-mast-fdp` | MAST / MAST-U signals through the FAIR MAST public store |
+| `toksearch-mast-imas` | Reaching MAST / MAST-U data by IMAS path rather than by group name |
+| `toksearch-basics` | The TokSearch pipeline API the other skills are written against |
+| `toksearch-signals` | TokSearch signal classes: MDSplus and Zarr sources |
+| `toksearch-mds` | MDSplus trees, signal paths and tag enumeration over Pelican |
+| `toksearch-backends` | Serial, multiprocessing, Ray and Spark execution |
+| `small-cnn-pytorch` | Training a compact CNN on a small dataset |
 
 ## Examples
 

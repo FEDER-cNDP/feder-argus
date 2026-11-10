@@ -119,8 +119,16 @@ def fetch_ptdata(shot, pointnames, timeout=600):
 
         # `fdp run` -- NOT `python` -- so this is a real subprocess and not
         # routed back into the kernel by the agent backend.
+        #
+        # `-D d3d` is REQUIRED, not decoration. Once a second device is
+        # installed (toksearch_cmod registers Alcator C-Mod), a bare `fdp run`
+        # tries to combine every registered device's environment, finds that
+        # d3d and cmod set `default_tree_path` to different values, and refuses
+        # -- so PTDATA returns nothing. PTDATA is a DIII-D facility, so the
+        # device is never ambiguous here and naming it costs nothing.
         proc = subprocess.run(
-            ["fdp", "run", "python", script, str(shot), json.dumps(pointnames), npz],
+            ["fdp", "-D", "d3d", "run", "python", script,
+             str(shot), json.dumps(pointnames), npz],
             capture_output=True, text=True, timeout=timeout,
         )
         tail = "\n".join((proc.stdout + proc.stderr).strip().splitlines()[-6:])

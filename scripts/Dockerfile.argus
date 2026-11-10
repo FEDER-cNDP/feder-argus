@@ -1,0 +1,497 @@
+# =============================================================================
+# ARGUS-FEDER — NRP JupyterHub image
+# =============================================================================
+# Latest ARGUS agent layer grafted onto DeepTok's TokSearch + FDP/Pelican layer.
+#
+#   Agent layer (from ~/deep_ndp/sage):
+#     - deepagents-code 0.1.54  (brings deepagents 0.7.5 + langchain-openai)
+#     - sage_magic.py  → %ask / %%ask / %reset  (KernelShellBackend)
+#     - deepseek-v4-flash via NRP, default model (glm-5's NRP serving became
+#       quantized and effectively unusable; glm-4.7 retired earlier, removed
+#       from the model list; glm-5 stays available via `-M glm-5`)
+#   Data layer (from DeepTok):
+#     - toksearch + fdp-d3d (Pelican/XRootD) + fdp (PTDATA support; also
+#       provides the `fdp run` subcommand CLI used by skill execution rules)
+#     - baked Pelican/XRootD env vars; ~/.fdp/token loaded at kernel start
+#   Base: python-3.12 (REQUIRED — toksearch does not support 3.13+; ARGUS runs on 3.12)
+#
+# Before building, check the skills' worked examples still match the data they
+# describe -- SKILL.md numbers are quoted verbatim by the agent and have gone
+# stale three times (a deleted run, a shot count, a pooled class list):
+#   python feder/elm_index/tests/check_skill_examples.py
+#   python feder/disruption_example/tests/check_skill_examples.py
+#   (needs network and a valid FDP token -- they check against the live index)
+#
+# And check no skill states a fact the data could falsify -- a count that was
+# true when written becomes a wrong answer the moment GA sends new data, and
+# the agent quotes SKILL.md verbatim:
+#   python scripts/lint_skill_generality.py
+#
+# Build:
+#   docker build -t argus-feder:0.1.7-rc35 -f scripts/Dockerfile.argus .
+#
+# Tagging convention:
+#   iterate rc1, rc2, ...      docker build -t argus-feder:0.1.7-rc35 ...
+#   promote when satisfied:    docker tag argus-feder:0.1.6-rc<N> argus-feder:0.1.6
+#   next cycle:                argus-feder:0.1.7-rc35, ...
+#   An rc tag always sorts BELOW its release, so never cut an rc for a version
+#   already published — 0.1.5 is promoted and live on DockerHub, so the next
+#   rc is 0.1.7-rc35.
+#
+# Run (test — no secrets baked in; supply at runtime):
+#   docker run -d --name argus-feder \
+#     -e NRP_API_KEY="<key>" \
+#     -v ~/.fdp/token:/home/jovyan/.fdp/token:ro \
+#     argus-feder:0.1.7-rc35 sleep infinity
+#
+# Credentials (never baked into the image):
+#   - LLM key: env var NRP_API_KEY, or a .env containing NRP_API_KEY=...
+#   - Pelican: token at /home/jovyan/.fdp/token (loaded into BEARER_TOKEN at
+#              kernel start; restart the kernel if added after startup)
+#
+# Skills shipped: toksearch-basics/backends/mds/signals, d3d-shot-fetcher,
+#   d3d-filterscopes, d3d-relational-db, d3d-imas-terms, signal-zoom,
+#   d3d-elm-index, d3d-elm-phase-analysis, d3d-disruption, d3d-materials
+#   (small-cnn-pytorch is stripped)
+#
+# openpyxl / pypdf / python-docx are for the files that arrive WITH a materials
+# delivery -- spreadsheets, reports, setup drawings. Without them the agent runs
+# `pip install --user` mid-cell, over the network, once per notebook: one Q6 run
+# spent over five minutes on a single such install before it could read a PDF.
+# They are small and pure-Python, and the file types are not going away.
+#
+# d3d-materials reads the `materials` schema and fetches the files delivered
+# with the samples. The sample archive itself is NOT baked and never should be:
+# it is served from the FastAPI host behind the same FDP token as d3drdb, so
+# the image carries no copy to distribute or to go stale.
+#
+# Databases are NOT baked and are no longer files at all. Since 0.1.7 the three
+# d3d skills read the FEDER lakehouse over HTTP -- nothing to download, nothing
+# to place in a folder, and no copy to go stale:
+#   d3d-relational-db, d3d-elm-index, d3d-disruption -> $FEDER_API_URL
+#     (default https://sparcal.sdsc.edu/api/v1/FEDER)
+#
+# That service runs with FEDER_AUTH_MODE=required, so the pod needs BOTH:
+#   * outbound HTTPS to the endpoint
+#   * a valid FDP token. Searched in this order:
+#       $FEDER_API_TOKEN / $FDP_TOKEN / $BEARER_TOKEN
+#       ~/.fdp/token                     (what Pelican reads; wiped by a restart)
+#       ~/work/_User-Persistent-Storage_CephBlock_/.fdp/token   (survives one)
+#     When two files exist the one expiring LATEST wins, so a stale leftover in
+#     ~/.fdp/token cannot shadow a freshly renewed token beside it.
+# It is the same token Pelican already needs, so a working pod has one. An
+# EXPIRED token fails every skill call at once; check before a demo with
+#   python /opt/feder/pod_preflight.py        (baked into the image)
+# =============================================================================
+
+# python-3.12 required: toksearch does not support Python 3.13+
+FROM quay.io/jupyter/base-notebook:python-3.12
+
+# -----------------------------------------------------------------------------
+# Step 0: Environment + system tools
+# -----------------------------------------------------------------------------
+USER root
+ENV DEBIAN_FRONTEND=noninteractive
+
+# /opt/conda/bin first so fdp/mdsplus internals find the conda python.
+ENV PATH="/opt/conda/bin:$PATH"
+RUN ln -sf /opt/conda/bin/python3 /opt/conda/bin/python 2>/dev/null || true
+
+RUN apt-get update && apt-get install -y \
+    git curl wget zip unzip vim \
+    openssh-client rsync ripgrep \
+    less tree htop nano jq \
+    build-essential ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# -----------------------------------------------------------------------------
+# Step 1: Data layer -- FDP core, for BOTH DIII-D and Alcator C-Mod
+# -----------------------------------------------------------------------------
+# Per Brian Sammuli (GA), 2026-10-05, for the cross-device workspace.
+#
+# `fdp-core-latest` is the metapackage that pulls the whole FDP stack: fdp,
+# toksearch, toksearch_d3d, ptdata, libfdpio2, xrdcl-pelican-fdp, mdsplus-xrdcl,
+# mdsip-fdp, imas_composer, fdp-schema, cmflib, toksearch_cmf, pelicanplatform.
+#
+# `-latest` is NOT a synonym for `fdp-core`. fdp-core 1.25.0 hard-pins
+# `python 3.11.*` and would drag this image off 3.12, where ARGUS and every
+# skill live; fdp-core-LATEST is noarch with `python >=3.11` and loose bounds,
+# so it resolves on 3.12. Changing this to `fdp-core` relocates the whole image.
+#
+# >=1.25.0 is required, not cosmetic: earlier releases shipped a cmflib that
+# overwrote the MCP SDK, so the TokSearch MCP server would not start.
+#
+# `toksearch_cmod` is NOT in fdp-core and must be named separately. It carries
+# the official C-Mod catalog AND MIT's TDI functions and FORTRAN libraries;
+# without it `\ip` and roughly twenty other C-Mod nodes do not evaluate -- the
+# trees still open, which makes its absence look like a data problem rather
+# than a missing package. linux-64 only; the py312 build is what we resolve to.
+#
+# numpy<2 is kept: toksearch needs it and so does disruption-py downstream.
+RUN mamba install -c ga-fdp -c conda-forge \
+        "fdp-core-latest>=1.25.0" toksearch_cmod "numpy<2" -y && \
+    mamba clean -ya
+
+# A hand-written cmod catalog lived here in 0.1.15-rc2, before toksearch_cmod
+# was known to exist. It is deliberately NOT carried forward: fdp's catalog
+# discovery raises RuntimeError on a duplicate tokamak name, so shipping both
+# would break every fdp invocation in the image.
+
+# -----------------------------------------------------------------------------
+# Step 1b: disruption-py, in an environment of its own
+# -----------------------------------------------------------------------------
+# Brian's instruction, and the reason is a genuine conflict: disruption-py wants
+# STOCK MDSplus plus `mdsip-fdp`, and must NOT see toksearch, ptdata or XRootD.
+# Those are exactly what Step 1 installs, so the two cannot share a prefix.
+#
+# Installed from MIT's `dev` at a pinned commit rather than the 0.14.0 release,
+# which predates `get_current_quench_time`.
+#
+# DIII-D only. For C-Mod we do NOT run disruption-py: MIT already ran it and
+# staged the result on the origin as cmod_origin_shots_v2.nc, which is the same
+# 438 shots / 39,038 time slices our lakehouse already serves.
+# disruption-py builds its scratch directory from $USER and fails at IMPORT if
+# it is unset -- os.path.join(..., os.getenv("USER"), ...) raises TypeError.
+# The base image does not set it, so without this the package cannot be used.
+ENV USER=jovyan
+
+# Built from GA's own environment.yml rather than a hand-written package list,
+# and from GA-FDP's branch rather than MIT@da2f6c4 -- Brian's prose named the
+# MIT commit, but his environment.yml points at the GA-FDP branch, which is
+# MIT's code plus README_FDP.md, examples and tests/test_fdp_origin.py. The
+# acceptance check he gave (`pytest tests/test_fdp_origin.py` -> 3 passed)
+# only exists there, so the repo is cloned, not just pip-installed.
+#
+# NOTE: no numpy pin here, deliberately. 0.15.0.dev0 takes numpy 2.x, and this
+# prefix has no toksearch to disagree with it. The main env keeps numpy<2.
+RUN git clone --depth 1 -b sammuli/fdp-origin-config \
+        https://github.com/GA-FDP/disruption-py.git /opt/disruption-py-fdp && \
+    mamba env create -f /opt/disruption-py-fdp/environment.yml && \
+    mamba clean -ya
+ENV DPY_ENV=/opt/conda/envs/disruption-py-fdp
+# The import check runs as root, and disruption-py creates its scratch tree
+# ($LOCALSCRATCH or /tmp, then $USER) as a SIDE EFFECT of being imported. Left
+# behind, /tmp/jovyan is root-owned and the same import then fails at runtime
+# with PermissionError. So the check cleans up after itself.
+RUN $DPY_ENV/bin/python -c "from disruption_py.workflow import get_shots_data; print('disruption-py ok')" && \
+    rm -rf /tmp/jovyan && \
+    chown -R 1000:100 /opt/disruption-py-fdp
+
+# Off-site, disruption-py reaches DIII-D MDSplus through the FDP origin rather
+# than GA's `atlas`. This is the piece that makes `ptdata()` resolve: it is an
+# MDSplus server endpoint, which a bare local mdsip is not.
+RUN mkdir -p /home/jovyan/.config/disruption-py && \
+    printf '[d3d.inout.mds]\nmdsplus_connection_string = "fdp://fdp-d3d-origin.nationalresearchplatform.org:8443/mdsip"\n' \
+        > /home/jovyan/.config/disruption-py/user.toml && \
+    chmod 600 /home/jovyan/.config/disruption-py/user.toml && \
+    chown -R 1000:100 /home/jovyan/.config
+
+# -----------------------------------------------------------------------------
+# Step 2: Baked Pelican/XRootD environment (static vars only)
+# -----------------------------------------------------------------------------
+# Available to ALL processes (kernel, agent subprocesses, terminals) without the
+# fdp wrapper. BEARER_TOKEN is the only dynamic var — set at kernel start from
+# ~/.fdp/token via 01-deeptok-pelican.py.
+# LD_PRELOAD is intentionally NOT baked globally (would break ssh/scp via conda
+# OpenSSL conflicts). The XRootD POSIX preload IS required for MDSplus to read
+# Pelican tree files, so it is injected into the Jupyter kernelspec (Step 9b) —
+# scoped to the kernel process, not image-wide.
+# Pick the device for any command that does not name one. REQUIRED once a
+# second device is installed: `fdp run` otherwise tries to combine every
+# registered device's environment, finds d3d and cmod set `default_tree_path`
+# to different values, and refuses -- which broke every PTDATA fetch in 0.1.15,
+# because the skills invoke `fdp run python script.py` without a device.
+#
+# This does not affect C-Mod work, which uses the explicit form GA documents:
+#     eval "$(python -m fdp -D cmod env)"
+# `fdp -D cmod env` still returns C-Mod's paths with this set.
+ENV FDP_DEFAULT_DEVICE=d3d
+
+ENV XROOTD_VMP="fdp-d3d-origin.nationalresearchplatform.org:8443:/fdp-d3d"
+ENV TOKSEARCH_INDEX_DIR="/fdp-d3d/archives/index/dbs/current"
+ENV X509_CERT_FILE="/opt/conda/ssl/cacert.pem"
+ENV PTDATA_LIBRARY="/opt/conda/lib/libd3.so"
+ENV MDS_PATH="/opt/conda/tdi"
+ENV MKL_NUM_THREADS="1"
+ENV NUMEXPR_NUM_THREADS="1"
+ENV OMP_NUM_THREADS="1"
+ENV TDSVER="7.0"
+ENV D3DATA="yes"
+# Static efit01 fallback (correct codes/ template). The FULL, correct per-tree
+# path set — including raw diagnostic trees (spectroscopy, electrons) which live
+# under shots/ with a different template — is configured at kernel startup by
+# 01-deeptok-pelican.py via fdp's mdsplus_d3d_env.py.
+# This POSIX-style path requires LD_PRELOAD (Step 9b, kernelspec) to resolve via
+# XRootD — verified compatible with `fdp run` subprocess calls too, since they
+# inherit the kernel's env (inherit_env=True in KernelShellBackend) including
+# LD_PRELOAD. Do NOT remove this without re-verifying with LD_PRELOAD unset —
+# that combination (baked efit01_path + no LD_PRELOAD) is the one case that fails.
+ENV efit01_path="/fdp-d3d/archives/mdsplus/usershots/~t;/fdp-d3d/archives/mdsplus/codes/~t/~j~i/~h~g/~f~e/~d~c;/fdp-d3d/archives/mdsplus/models/~t"
+
+# -----------------------------------------------------------------------------
+# Step 2b: PTDATA environment -- makes PTDATA work WITHOUT the `fdp run` wrapper
+# -----------------------------------------------------------------------------
+# `fdp run` was never doing anything magic for PTDATA: it sets these nine static
+# variables. Without PTDATA_LOC=1 and the JSON-index plugin, the client falls
+# back to resolving a network service named PTSERVER, which does not exist here,
+# and every in-kernel PTDATA fetch dies with:
+#     getservbyname failed for task 'PTSERVER' ... not in /etc/services
+#
+# That error cost three separate agent sessions. The rule "always use fdp run for
+# PTDATA" was written into the skill three times, promoted to the top of the file,
+# and still failed -- the last time because the agent never opened the skill at
+# all (the request looked like re-analysis, not a fetch). A rule the agent must
+# read cannot fix a case where it does not read. Baking the variables removes the
+# failure mode instead of documenting it.
+#
+# All nine are CONSTANTS -- verified by diffing `env` inside and outside
+# `fdp run`. BEARER_TOKEN and the per-tree paths are the only dynamic parts and
+# are still set at kernel start by 01-deeptok-pelican.py.
+#
+# `fdp run` keeps working unchanged: it sets these same values, so it is now a
+# no-op for them. Existing notebooks and skill guidance that use `fdp run` remain
+# correct.
+ENV PTDATA_LOC="1"
+ENV PTDATA_JSON_INDEX_DIR="pelican://osg-htc.org:443/fdp-d3d/archives/index/json"
+ENV PTDATA_JSON_INDEX_PATTERN="json_indexes_*"
+ENV PTDATA_PLUGIN_LIB="/opt/conda/lib/libjson_index_plugin.so"
+ENV SYS_D3_DELIM=";"
+ENV XRDCP_ALLOW_HTTP="true"
+ENV XRD_CURLDISABLEPREFETCH="1"
+ENV XRD_PELICANUSEAUTHHEADERS="true"
+ENV XRD_PLUGINCONFDIR="/opt/conda/etc/xrootd/client.plugins.d"
+
+# The agent's per-skill Learnings.md root. sage_magic resolves this env var
+# first and otherwise falls back to ~/.sage_learnings -- which is under
+# /home/jovyan and does NOT survive a pod restart, so a skill's accumulated
+# API-shape lessons are silently lost between sessions. ARGUS points this at
+# the persistent mount; point ours at the same place, so the two share one
+# learnings root (they do not collide -- the subdirectory is the skill name).
+ENV SAGE_LEARNINGS_PATH="/home/jovyan/work/_User-Persistent-Storage_CephBlock_/.sage_learnings"
+
+# -----------------------------------------------------------------------------
+# Step 3: Agent layer — ARGUS (deepagents-code)
+# -----------------------------------------------------------------------------
+# JupyterLab pinned to 4.2.4 to match NRP JupyterHub runtime (avoids labextension
+# API mismatch when NRP downgrades jupyterlab at pod start).
+# deepagents-code 0.1.54 brings deepagents 0.7.5 + langchain-openai as default
+# deps. numpy<2 kept to satisfy toksearch/fdp. Heavy geo libs (folium/geopandas)
+# are intentionally omitted — sage_magic imports them lazily and degrades
+# gracefully; fusion outputs use pandas/matplotlib.
+#
+# Upgraded from 0.1.10 (deepagents 0.6.8) to match ARGUS. Upstream re-verified
+# every binding ARGUS depends on; the FEDER-side risk is different and is the
+# reason this is an rc: `fdp run` subprocesses and toksearch/MDSplus fetches go
+# through the same KernelShellBackend execute path that changed signature here.
+# The one upstream break was apply_sage_patch.py's detect_provider anchor (0.1.54
+# inserted a Fireworks branch); the patch now anchors on the nvidia branch alone
+# and exits non-zero rather than shipping an image where bare `glm-*` names fail
+# to resolve to NRP.
+RUN pip install --no-cache-dir \
+    "jupyterlab==4.2.4" "notebook==7.2.2" \
+    "deepagents-code==0.1.54" \
+    nest_asyncio python-dotenv tomli-w ipywidgets \
+    pandas matplotlib plotly "numpy<2" \
+    openpyxl pypdf python-docx
+
+# -----------------------------------------------------------------------------
+# Step 4: Copy assets
+# -----------------------------------------------------------------------------
+# The pod preflight, baked in rather than scp'd. It was a standalone file the
+# user copied over, so it could drift from the image it was testing -- and did:
+# a stale copy searched one token path while the image searched two, reported
+# "no token found", and cost a pod restart to diagnose. A check that can
+# disagree with what it checks is worse than no check.
+#   python /opt/feder/pod_preflight.py
+COPY feder/lakehouse_api/tests/pod_preflight.py /opt/feder/pod_preflight.py
+
+COPY skills /tmp/build/skills
+COPY scripts/apply_sage_patch.py /tmp/build/
+COPY scripts/sage_magic.py /tmp/build/
+COPY scripts/sage_kernel_backend.py /tmp/build/
+COPY scripts/deeptok_pelican.py /tmp/build/
+# review_rules.md is the one build input whose path differs between the two
+# repos, and sync_feder_argus.sh rewrites this COPY line when it copies.
+#
+#   deep_tok       internal_use/review_rules.md -- gitignored, local only, so a
+#                  fresh clone of THIS repo cannot build the image. Releases are
+#                  not cut from here for that reason.
+#   feder-argus    review_rules.md at the root -- versioned, and the same file
+#                  install.py serves to Colab and local users, so the rubric in
+#                  the image and the rubric those users get cannot disagree.
+#
+# The criteria count is asserted after the build (see build_argus_feder.sh), so
+# a stale rubric fails the build rather than shipping.
+COPY review_rules.md /tmp/build/
+
+# -----------------------------------------------------------------------------
+# Step 5: Patch deepagents_code config (glm-* → nrp provider)
+# -----------------------------------------------------------------------------
+RUN python /tmp/build/apply_sage_patch.py
+
+# -----------------------------------------------------------------------------
+# Step 6: Install skills
+# -----------------------------------------------------------------------------
+# small-cnn-pytorch stays in the repo as a reference but is NOT shipped to the
+# agent -- it is an old ML-demo skill, out of scope for data Q&A.
+# The find/rm strips editor backups and stale bytecode that `COPY shared/skills`
+# would otherwise bake in (0.1.1 shipped a d3d-shot-fetcher/SKILL.md.bak from an
+# old v1.0 of that skill, plus __pycache__ dirs). A stray .bak matters more than
+# it looks: it carries its own outdated `description:` frontmatter, and skill
+# descriptions ARE the agent's routing menu.
+RUN mkdir -p /home/jovyan/.deepagents/agent/skills && \
+    cp -r /tmp/build/skills/* /home/jovyan/.deepagents/agent/skills/ && \
+    rm -rf /home/jovyan/.deepagents/agent/skills/small-cnn-pytorch && \
+    rm -rf /home/jovyan/.deepagents/agent/skills/_shared && \
+    find /home/jovyan/.deepagents/agent/skills \
+        \( -name '*.bak' -o -name '*.orig' -o -name '__pycache__' \) \
+        -exec rm -rf {} +
+
+# -----------------------------------------------------------------------------
+# Step 7: NRP provider config (deepseek-v4-flash default — glm-5's NRP serving
+# became quantized and effectively unusable; glm-5 stays listed so `-M glm-5`
+# still resolves for anyone who asks for it explicitly)
+# -----------------------------------------------------------------------------
+RUN python -c "\
+import tomli_w; from pathlib import Path; \
+p = Path('/home/jovyan/.deepagents/config.toml'); p.parent.mkdir(parents=True, exist_ok=True); \
+tomli_w.dump({ \
+    'models': { \
+        'default': 'nrp:deepseek-v4-flash', \
+        'providers': { \
+            'nrp': { \
+                'class_path': 'langchain_openai:ChatOpenAI', \
+                'models': ['deepseek-v4-flash', 'glm-5'], \
+                'api_key_env': 'NRP_API_KEY', \
+                'base_url': 'https://ellm.nrp-nautilus.io/v1', \
+                'params': {'temperature': 0, 'stream_chunk_timeout': 1200.0, 'max_retries': 6}, \
+            } \
+        } \
+    } \
+}, open(p, 'wb')); \
+print('Written', p)"
+
+# NRP/deepseek only, and deliberately the only provider in the image.
+#
+# ARGUS-FEDER runs on NRP. An external commercial LLM is not a default this
+# project can ship: DOE may not permit one, and an image that declares a
+# provider invites its use. A demo that wants a different model supplies its own
+# config.toml at run time -- see scripts/model_configs/ -- rather than finding
+# one baked here.
+#
+# ~/.deepagents/config.toml can be replaced on a running pod and takes effect on
+# the next cell: nothing in deepagents_code.config is cached, and %%ask builds
+# the model fresh per invocation.
+
+# -----------------------------------------------------------------------------
+# Step 7b: FEDER additions to the %%ask --review rubric
+# -----------------------------------------------------------------------------
+# ARGUS ships three base criteria and reads deployment additions from this exact
+# path -- no environment variable, no session override. That is deliberate: it
+# makes "passed review" mean the same thing for every reader of a shared
+# notebook, which a per-user file cannot.
+#
+# Baked rather than left to the user because ~ is EPHEMERAL on an NRP pod. A
+# copy placed by hand vanishes on the next pod recycle, and the failure is
+# silent -- the rubric quietly drops from 6 criteria back to 3 and every answer
+# still looks reviewed. That happened; it is why this step exists.
+#
+# Same file the Colab installer fetches from the argus_feder repo, so both
+# platforms grade against one definition.
+RUN mkdir -p /home/jovyan/.deepagents && \
+    cp /tmp/build/review_rules.md /home/jovyan/.deepagents/review_rules.md && \
+    echo "review criteria added: $(grep -c '^- ' /home/jovyan/.deepagents/review_rules.md)"
+
+# -----------------------------------------------------------------------------
+# Step 8: KernelShellBackend importable in site-packages
+# -----------------------------------------------------------------------------
+RUN cp /tmp/build/sage_kernel_backend.py \
+    "$(python -c 'import site; print(site.getsitepackages()[0])')/sage_kernel_backend.py"
+
+# -----------------------------------------------------------------------------
+# Step 9: Register %%ask magic + Pelican token loader at kernel startup
+# -----------------------------------------------------------------------------
+RUN mkdir -p /home/jovyan/.ipython/profile_default/startup && \
+    cp /tmp/build/sage_magic.py \
+       /home/jovyan/.ipython/profile_default/startup/00-sage-magic.py && \
+    cp /tmp/build/deeptok_pelican.py \
+       /home/jovyan/.ipython/profile_default/startup/01-deeptok-pelican.py
+
+# -----------------------------------------------------------------------------
+# Step 9b: Inject LD_PRELOAD into the Jupyter kernelspec (kernel-scoped)
+# -----------------------------------------------------------------------------
+# The XRootD POSIX preload must be present at kernel PROCESS LAUNCH so MDSplus
+# opens of /fdp-d3d/... tree files are redirected over XRootD. Setting it in the
+# kernelspec scopes it to the Jupyter kernel only (terminals/ssh unaffected).
+RUN python -c "\
+import json; from pathlib import Path; \
+p = Path('/opt/conda/share/jupyter/kernels/python3/kernel.json'); \
+d = json.loads(p.read_text()); \
+d.setdefault('env', {})['LD_PRELOAD'] = '/opt/conda/lib/libXrdPosixPreload.so'; \
+p.write_text(json.dumps(d, indent=1)); \
+print('kernelspec env =', d['env'])"
+
+# -----------------------------------------------------------------------------
+# Step 10: Load NRP_API_KEY from persistent storage for terminal users
+# -----------------------------------------------------------------------------
+RUN printf '\n# ARGUS-FEDER: load NRP_API_KEY from persistent storage if available\n' \
+        >> /home/jovyan/.bashrc && \
+    echo 'DOTENV="/home/jovyan/work/_User-Persistent-Storage_CephBlock_/.env"' \
+        >> /home/jovyan/.bashrc && \
+    echo 'if [ -f "$DOTENV" ]; then set -a; source "$DOTENV"; set +a; fi' \
+        >> /home/jovyan/.bashrc && \
+    echo 'unset DOTENV' >> /home/jovyan/.bashrc
+
+# -----------------------------------------------------------------------------
+# Step 10b: Silence the "cannot find name for group ID" warning in terminals
+# -----------------------------------------------------------------------------
+# Ubuntu's stock /etc/bash.bashrc (inherited from the base image) runs
+# `case " $(groups) " in *\ admin\ *|*\ sudo\ *)` on every interactive shell to
+# decide whether to print a sudo hint. NRP starts the pod with a supplementary
+# group (GID 993) that has no entry in the container's /etc/group, so `groups`
+# writes "groups: cannot find name for group ID 993" to stderr before the
+# prompt on every JupyterLab Terminal. The sudo hint itself never prints — the
+# warning is only its side effect, and it is purely cosmetic: group permissions
+# resolve on the numeric GID, which is unaffected.
+#
+# .hushlogin is the guard that block already tests for, so it suppresses the
+# warning without touching bashrc. Do NOT instead add 993 to /etc/group: the GID
+# is assigned by the Kubernetes pod spec and can change on any NRP redeploy.
+RUN touch /home/jovyan/.hushlogin
+
+# -----------------------------------------------------------------------------
+# Step 11: Ownership + cleanup
+# -----------------------------------------------------------------------------
+RUN chown -R jovyan:users /home/jovyan/.deepagents \
+                          /home/jovyan/.ipython && \
+    chown jovyan:users /home/jovyan/.hushlogin && \
+    rm -rf /tmp/build
+
+# deepagents' summarization middleware offloads older messages to disk once a
+# run grows past its token budget, and reads them back when it needs the
+# detail again. It derives the location from the backend:
+#
+#   artifacts_root = backend.artifacts_root if isinstance(backend, CompositeBackend) else "/"
+#   self._history_path_prefix = f"{artifacts_root.rstrip('/')}/conversation_history"
+#
+# Our backend is not a CompositeBackend, so the root is "/" and the prefix
+# becomes "/conversation_history" -- at the filesystem root, which jovyan
+# cannot create. Every long cell then prints a permission error followed by
+# "Older messages will not be recoverable", and the offload silently does not
+# happen: the agent loses the ability to read back its own earlier tool
+# results, which is exactly the material the review grader checks claims
+# against.
+#
+# Creating the two directories it wants, owned by jovyan, is the whole fix.
+# They are inside the container and hold only run scratch.
+RUN mkdir -p /conversation_history /large_tool_results && \
+    chown jovyan:users /conversation_history /large_tool_results
+
+# -----------------------------------------------------------------------------
+# Step 12: Switch to JupyterHub user
+# -----------------------------------------------------------------------------
+USER jovyan
+WORKDIR /home/jovyan/work
+
+EXPOSE 8888
+CMD ["sleep", "infinity"]
