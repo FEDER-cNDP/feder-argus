@@ -98,6 +98,11 @@ check "watcher taken back on error"  "1"  "ipython -c \"import IPython.display a
 # the previous model, silently and with a perfectly good answer.
 check "%model magic installed"        "1"  "grep -c 'def model(line)' $MAGIC"
 check "%model clears config cache"    "1"  "grep -c 'model_config.clear_caches' $MAGIC"
+# --default restored models.default and left the nrp PROVIDER BLOCK wherever a
+# previous --name had pointed it, so the display read nrp:deepseek-v4-flash
+# against the z.ai endpoint with ZAI_API_KEY. Name says one thing, endpoint
+# says another, and nothing in between disagrees.
+check "%model --default restores the block" "1" "grep -c 'moved = .k for k in (\"base_url\", \"api_key_env\")' $MAGIC"
 check "tomlkit (%model needs it)"     "1"  "python -c 'import tomlkit' >/dev/null 2>&1 && echo 1 || echo 0"
 # The data layer. These were unpinned and silently stale for several releases
 # (see Dockerfile.argus step 1), so the versions are asserted here too: a pin

@@ -4204,13 +4204,36 @@ def _model_upsert_provider(provider, url=None, api_key_env=None, model=None,
 def _model_restore_default(path=None):
     """Back to the shipped NRP default.
 
-    Usually a one-key change, because provider blocks are never overwritten.
+    Not just the default key. This used to assume provider blocks are never
+    overwritten, and they are: naming a block explicitly is taken as meaning
+    you want to change it, so `%model --name nrp:glm-5 --url https://api.z.ai/
+    ... --api-key-env ZAI_API_KEY` points the NRP block at z.ai. Restoring only
+    `models.default` then left a configuration reading
+
+        model     nrp:deepseek-v4-flash
+        endpoint  https://api.z.ai/api/coding/paas/v4
+        api key   ZAI_API_KEY is set
+
+    -- a deepseek model addressed to Zhipu with the wrong credential. The name
+    said NRP and nothing else did. So the endpoint and key variable are put
+    back as well whenever they have moved, and the caller is told which it was.
+
     If the nrp block has gone missing, prefer the backup over the constants --
     the backup is what the image actually shipped.
     """
     tomlkit = _model_tomlkit()
     doc = _model_load(path)
     source = "default key only"
+    if "nrp" in _model_providers(doc):
+        blk = _model_providers(doc)["nrp"]
+        moved = [k for k in ("base_url", "api_key_env")
+                 if blk.get(k) not in (None, _MODEL_SHIPPED_NRP[k])]
+        if moved:
+            for k in moved:
+                blk[k] = _MODEL_SHIPPED_NRP[k]
+            source = "default key, and the nrp " + " and ".join(
+                "endpoint" if k == "base_url" else "key variable"
+                for k in moved)
     if "nrp" not in _model_providers(doc):
         backup = Path(str(Path(path or _MODEL_CONFIG_PATH)) + ".orig")
         recovered = False
