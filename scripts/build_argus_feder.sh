@@ -2,7 +2,7 @@
 # Build, verify, push and tidy an ARGUS-FEDER image.
 #
 #   ./scripts/build_argus_feder.sh 0.1.8-rc12              # build + verify
-#   ./scripts/build_argus_feder.sh 0.1.8-rc12 --push       # + push, delete the previous rc
+#   ./scripts/build_argus_feder.sh 0.1.8-rc12 --push       # + push, delete the previous LOCAL rc
 #   ./scripts/build_argus_feder.sh 0.1.8-rc12 --push --keep-previous
 #
 # Why this exists rather than a hand-typed docker build:
@@ -257,8 +257,16 @@ fi
 grep -o 'digest: sha256:[0-9a-f]*' "${LOG}.push" | tail -1 | sed 's/^/    /'
 
 # --------------------------------------------------------------- cleanup -----
-# Delete ONLY the superseded rc tags, by exact name. Never a prune: this is a
-# shared machine and other projects' images live in the same daemon.
+# Delete ONLY the superseded rc tags, by exact name, FROM THE LOCAL DAEMON.
+# Never a prune: this is a shared machine and other projects' images live in
+# the same daemon.
+#
+# Nothing here touches a registry, and `docker rmi` cannot: the only remote
+# operation in this script is the `docker push` above. Superseded rc tags
+# therefore accumulate on Docker Hub and are removed by hand, deliberately,
+# or not at all. A reader of an earlier version of this comment reasonably
+# concluded the cleanup was broken because old rc tags were still published;
+# it was the comment that was wrong.
 if [ $KEEP -ne 1 ]; then
     # Matched under BOTH names: if one of the pair was already removed by hand,
     # looking only at the plain name finds nothing and leaves a 7GB orphan

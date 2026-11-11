@@ -28,12 +28,21 @@ Two things follow for anything automated:
 ## Building
 
     ./scripts/build_argus_feder.sh <version>            # build and verify
-    ./scripts/build_argus_feder.sh <version> --push     # also push, and drop the superseded rc tags
+    ./scripts/build_argus_feder.sh <version> --push     # also push
 
 The script builds `argus-feder:<version>` and `kaiucsd/argus-feder:<version>`,
 then runs its checks against the built image and exits non-zero if any fail.
 It does not push unless `--push` is given, so a failed verification cannot
 publish.
+
+After a successful push it deletes the superseded release-candidate tags **from
+the local Docker daemon**, so a 7 GB image does not accumulate once per rc on a
+shared machine. It does not, and cannot, delete anything from a registry:
+`docker rmi` is local, and the only remote operation in the script is the push
+itself. Published rc tags therefore stay published until someone removes them by
+hand. That is deliberate — deletion from a registry is irreversible, and these
+images are development builds whose storage cost is not worth automating a
+destructive permission for.
 
 The build context is the repository root, and `.dockerignore` narrows it to the
 roughly 2 MB the Dockerfile actually copies. Without that file the context is

@@ -15,6 +15,7 @@ every answer was produced by the agent from the question above it.
     examples/colab/        Colab variants of a subset of them (see the note below)
     skills/                the knowledge modules the agent uses to reach each data source
     review_rules.md        the criteria the agent's answers are checked against
+    CHANGELOG.md           what changed in each released image
     install.py             installs the skills into a session that has none
     scripts/               the Dockerfile, the build script, and the runtime files
                            the image installs into the kernel
