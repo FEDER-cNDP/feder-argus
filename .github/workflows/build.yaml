@@ -3,7 +3,6 @@ name: Build and publish ARGUS image
 on:
   push:
     tags: ['v*.*.*']                  # release tag like v0.2.1 = real build + push
-    branches: ['argus-build-workflow']   # TEMPORARY: dry run on every push to this branch; remove before merging
   workflow_dispatch:                  # manual button (once on main) = dry run
 
 env:
