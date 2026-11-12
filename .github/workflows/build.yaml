@@ -1,0 +1,58 @@
+name: Build and publish ARGUS image
+
+on:
+  push:
+    tags: ['v*.*.*']                  # release tag like v0.2.1 = real build + push
+  workflow_dispatch:                  # manual button (once on main) = dry run
+
+env:
+  IMAGE: gitlab-registry.nrp-nautilus.io/feder/argus-feder
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+
+      - uses: actions/checkout@v4
+
+      - name: Work out version
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+            echo "PUSH=--push" >> "$GITHUB_ENV"
+          else
+            echo "VERSION=0.0.0-dryrun" >> "$GITHUB_ENV"
+            echo "PUSH=" >> "$GITHUB_ENV"
+          fi
+          df -h /
+
+      - name: Refuse non-release and already-published versions
+        if: github.ref_type == 'tag'
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Not a plain X.Y.Z release: $VERSION"; exit 1; }
+          if docker manifest inspect "$IMAGE:$VERSION" >/dev/null 2>&1; then
+            echo "$IMAGE:$VERSION already exists, refusing to overwrite"; exit 1
+          fi
+
+      - name: Log in to NRP registry
+        if: github.ref_type == 'tag'
+        uses: docker/login-action@v3
+        with:
+          registry: gitlab-registry.nrp-nautilus.io
+          username: ${{ secrets.NRP_REGISTRY_USER }}
+          password: ${{ secrets.NRP_REGISTRY_TOKEN }}
+
+      - name: Point the build script at the NRP registry (CI copy only)
+        if: github.ref_type == 'tag'
+        run: |
+          sed -i "s|^HUB=\"kaiucsd/argus-feder:|HUB=\"${IMAGE}:|" scripts/build_argus_feder.sh
+          grep -n '^HUB' scripts/build_argus_feder.sh
+          grep -q "^HUB=\"${IMAGE}:" scripts/build_argus_feder.sh || { echo "HUB line not updated, stopping"; exit 1; }
+
+      - name: Build, run the 77 checks, push only if they pass
+        run: ./scripts/build_argus_feder.sh "$VERSION" $PUSH
