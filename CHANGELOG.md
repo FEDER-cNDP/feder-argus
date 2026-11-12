@@ -16,6 +16,49 @@ An invented changelog is worse than an absent one.
 
 ---
 
+## 0.2.1 — 2026-11-11
+
+**The `%%ask` progress trail no longer sends you to the end of the notebook.**
+
+0.2.0 said collapsing "no longer throws the view to the end of the notebook".
+On one path it still did, and this is that path: a run long enough that
+JupyterLab trims the output area and offers **Show More Outputs**. Clicking it
+rendered the whole trail at once, and when the cell finished the viewport was
+at the end of the notebook, with no cells in it.
+
+The cause was the trail being one notebook output per tool call. JupyterLab
+renders at most 50 of those and hides the rest behind that button; clicking it
+grew the cell by thousands of pixels, and collapsing then took all of it away
+in a single step — leaving the browser holding a scroll position past the end
+of a document that had just become much shorter.
+
+0.2.0 tried to put that right afterwards, with a script that measured where you
+were looking and moved the scroll back once the trail folded. That script is
+gone. What replaces it:
+
+- the trail is one output, updated in place, so the 50-output limit is never
+  reached and the Show More Outputs button cannot appear
+- while the agent works, the trail is a panel of fixed height that scrolls on
+  its own. Every tool call is still there to watch, and the cell stays the same
+  size whether the run makes five calls or a hundred and sixty
+- the fold now happens once the answer, its maps and the review verdict are all
+  on screen, so the cell grows by the answer before it shrinks by the trail and
+  your place in the notebook survives
+
+The panel is 420 px tall; `SAGE_TRAIL_LIVE_HEIGHT = 700` in a cell changes
+that, and `SAGE_FOLD_PROGRESS = False` turns the fold off altogether.
+
+Also in this release:
+
+- `%model --default` now restores the NRP endpoint and `NRP_API_KEY`, and not
+  just the default model name. Switching to another provider with
+  `%model --name nrp:<model> --url ... --api-key-env ...` repointed the `nrp`
+  block itself, and `--default` then left it repointed while reporting success
+  — so the cell said it was back on NRP while every request still went
+  somewhere else.
+
+---
+
 ## 0.2.0 — 2026-11-02
 
 **The `%%ask` progress trail now folds away once the answer is rendered.**
