@@ -640,8 +640,8 @@ def _display_tool_call(tool_name: str, args: dict) -> None:
     </div>
   </details>
 </div>"""
-    _sage_trail_add(html)
-    display(HTML(html))
+    if not _sage_trail_add(html):
+        display(HTML(html))
 
 
 # Directory listings taken at an `execute` call, compared at its result.
@@ -747,8 +747,8 @@ def _report_reclaimed(moved: list) -> None:
         f'{len(moved)} file(s) were written outside the working folder and have '
         f'been moved back into it:{rows}</div>'
     )
-    _sage_trail_add(html)
-    display(HTML(html))
+    if not _sage_trail_add(html):
+        display(HTML(html))
 
 
 def _display_tool_result(tool_name: str, content: str) -> None:
@@ -794,8 +794,8 @@ def _display_tool_result(tool_name: str, content: str) -> None:
         '  </details>'
         '</div>'
     )
-    _sage_trail_add(html)
-    display(HTML(html))
+    if not _sage_trail_add(html):
+        display(HTML(html))
 
 
 # ---------------------------------------------------------------------------
@@ -979,8 +979,8 @@ def _display_orphan_cleanup_warning(deleted: list[str]) -> None:
         'clear all working-directory files.'
         '</div></div>'
     )
-    _sage_trail_notice(html)
-    display(HTML(html))
+    if not _sage_trail_notice(html):
+        display(HTML(html))
 
 
 def _get_cell_id() -> str | None:
@@ -2576,10 +2576,16 @@ async def _run_agent_async(
         # JupyterLab doesn't serve arbitrary filesystem paths.
         if text_buffer:
             text = _fix_glm_markdown("".join(text_buffer))
-            _sage_trail_add_markdown(text)
-            found, _ = _render_markdown_with_files(text)
-            if not found:
-                display(Markdown(text))
+            # While the trail is folding, narration goes into the live view
+            # and nowhere else. A second rendering as its own output would
+            # outlive the fold, and a mid-stream `![](*.geojson)` would then
+            # put the same map above the one in the answer. The live view
+            # inlines PNGs itself (see _sage_md_to_html); a mid-stream map
+            # degrades to its file name there and is drawn with the answer.
+            if not _sage_trail_add_markdown(text):
+                found, _ = _render_markdown_with_files(text)
+                if not found:
+                    display(Markdown(text))
             text_buffer.clear()
         _had_tool_after_text[0] = True
         _skip_msg_id[0] = None
@@ -2892,8 +2898,8 @@ async def _run_agent_async(
             f"margin:8px 0; font-family:-apple-system,sans-serif; "
             f"font-size:13px; line-height:1.4'>⚠ {msg}</div>"
         )
-        _sage_trail_notice(_warn_html)
-        display(HTML(_warn_html))
+        if not _sage_trail_notice(_warn_html):
+            display(HTML(_warn_html))
 
     # --- review verdict -----------------------------------------------------
     # Stashed rather than displayed here: this function returns before the
@@ -3297,268 +3303,99 @@ def _sage_display_review(evals: list) -> None:
 # Folding the agent's progress once the answer is out
 # ---------------------------------------------------------------------------
 #
-# A %%ask cell streams one card per tool call while it runs -- 163 of them on a
-# long question -- and a reader wants that trail WHILE they wait, almost never
-# after. Once the answer is rendered the trail sits behind a one-line control,
-# one click from coming back.
+# A %%ask cell streams one card per tool call while it runs -- dozens of them
+# on a long question -- and a reader wants that trail WHILE they wait, almost
+# never after. Once the answer is rendered the trail sits behind a one-line
+# control, one click from coming back.
 #
 # NO JAVASCRIPT. The obvious way to fold outputs that are already on screen is
 # a script, and a script in saved output runs only in a TRUSTED notebook --
 # which a notebook opened in a new pod is not, because the signature that
 # records trust lives in the pod's ephemeral home. The fold would be there the
 # day the cell ran and gone the day the notebook was reopened. So the trail is
-# not folded where it lies: it is captured as it streams, and when the answer
-# is ready the cell's output is cleared and rewritten, with the whole trail
-# inside one <details> element.
+# not folded where it lies: it streams into ONE output, held by a display id
+# and updated in place, and when the answer is ready that same output is
+# replaced by the whole trail inside one <details> element.
 #
 # Collapsed is then what the .ipynb itself holds, and the browser does the
 # opening and closing. It survives a reload, a new pod, nbviewer and GitHub --
 # the same mechanism as the "details" link on each tool card, which has always
 # worked for exactly this reason.
 #
-# What that costs: the trail has to become ONE output, an output carries one
-# MIME type, and the agent's narration streams as Markdown -- so narration is
-# converted to HTML on the way into the buffer. And the clear takes the whole
-# cell, so anything written to it by code that does not pass through these
-# helpers would be lost; the warnings that belong above the fold are captured
-# too and re-emitted ahead of it.
+# What that costs: one output carries one MIME type, and the agent's narration
+# streams as Markdown -- so narration is converted to HTML on the way into the
+# buffer, and goes into the live view and nowhere else.
+#
+# Why ONE output, and not the dozens this used to emit. JupyterLab renders at
+# most `maxNumberOutputs` of them -- 50 by default -- and replaces the rest
+# with a "Show More Outputs" button. Clicking it rendered the whole trail, the
+# cell grew by thousands of pixels, and the fold then took all of that away in
+# a single step: the document shrank under the reader, the browser clamped a
+# scroll position that was now past the end, and `scrollPastEnd` left them in
+# the blank region below the last cell. One output never trips the cap, so the
+# button never appears; a bounded live view keeps the cell's height roughly
+# constant; and the fold became an update to one node rather than a
+# clear_output that tore down and rebuilt the entire output area.
 #
 # An interrupted run, an API error, or a run that ends without a summary never
-# reaches the rewrite, so its trail stays open and complete on screen -- which
-# is what you want when you are looking for what went wrong.
+# reaches the fold. Those paths call _sage_trail_expand instead, because the
+# live view is the only copy on screen and a reader hunting for what went
+# wrong needs all of it, not the last few steps.
+#
+# The first attempt at the jump was ~400 lines of transient JavaScript: a
+# recorder that measured where the reader was looking while the trail streamed,
+# and a correction that moved the scroll back after the fold. Both are gone,
+# and nothing replaces them. A correction cannot win against a document that
+# has already shrunk past the reader's position -- the browser clamps the
+# scroll to the new end before any script of ours is evaluated -- and the
+# reader's own scroll back outranked the correction's next pass. The cause is
+# removed instead: a live view of constant height, and a fold that lands after
+# the answer. The port back from the SAGE deployment, which took the fold
+# from here and then had to solve this.
 
 SAGE_FOLD_PROGRESS: bool = True  # set False to leave the trail expanded
 
-# Seconds to leave the scroll script on screen before erasing it. JupyterLab
-# applies an update to a display id as `_setOutput`, which REPLACES the output
-# widget, and rendering is asynchronous -- so an erase sent immediately after
-# the script wins the race against the render and the script is never
-# evaluated. The gap has to outlast one round trip to the browser plus a
-# render. It is spent at the very end of the cell, with the answer already on
-# screen.
-SAGE_SCROLL_ERASE_DELAY: float = 1.2
+# The live view is a box of FIXED HEIGHT holding the whole trail, so the cell
+# is the same size whether a run makes five tool calls or a hundred and sixty.
+# That is what the fold depends on: a constant-height cell leaves it almost no
+# height to take away at the end, and the reader's scroll position survives.
+# Going back through the run means scrolling the box, not the notebook.
+SAGE_TRAIL_LIVE_HEIGHT: int = 420        # px
+
+# An update to a display id re-sends the whole buffer, so a long run costs
+# O(n^2) bytes: cards are capped at 100 lines / 3000 chars, around 1-4 KB
+# each, which puts a 160-call run well past 100 MB through the kernel comm.
+# The budget caps the live view's payload instead of its item count -- a
+# 60-call run fits with room to spare, and only runs past that drop their
+# oldest cards from the live view. 0 means no budget.
+#
+# Nothing is dropped from the FOLD either way. This bounds only what is on
+# screen while the agent is still working.
+SAGE_TRAIL_LIVE_BYTES: int = 262144
+
+# An optional hard cap on live items, on top of the budget. 0 means none.
+SAGE_TRAIL_LIVE_ITEMS: int = 0
+
+# How the box is laid out. False (the default) reads oldest-to-newest, top to
+# bottom, and holds its scroll at the bottom where the newest card is. True
+# puts the newest card at the top instead -- see _sage_trail_live_html for why
+# that choice exists.
+SAGE_TRAIL_LIVE_NEWEST_FIRST: bool = False
 
 # What this cell has emitted, split by where it belongs once the trail folds:
-# "pre" is re-emitted above the control, "items" go inside it.
-_SAGE_TRAIL: dict = {"on": False, "pre": [], "items": [], "fold_id": None,
-                     "watch_id": None, "watch_handle": None,
-                     "block": None, "block_id": None}
+# "pre" stays above the control, "items" go inside it. "live_id" is the display
+# id of the single output both are rendered into.
+_SAGE_TRAIL: dict = {"on": False, "pre": [], "items": [],
+                     "fold_id": None, "block": None, "block_id": None,
+                     "live_id": None}
 _SAGE_MD_PARSER: list = [None]
-
-
-# The browser half of the fold is two scripts, and neither reaches the saved
-# file.
-#
-# This is the first of them, installed as the trail starts. It only records
-# where the reader is looking, because that cannot be recovered afterwards:
-# by the time the trail folds, the position the correction has to be measured
-# against is already gone. It never scrolls anything, and only the second
-# script -- erased at the end of the same run -- ever reads what it wrote.
-_SAGE_WATCH_JS = r"""(function () {
-  // Where is the reader looking? Nothing else can answer that once the trail
-  // has folded, so it is recorded while the trail still streams. This script
-  // never scrolls anything and never touches the page.
-  var KEY = WATCH_ID;
-
-  function scrollParent(el) {
-    var outer = el.closest ? el.closest('.jp-WindowedPanel-outer') : null;
-    if (outer) return outer;
-    for (var n = el.parentElement; n; n = n.parentElement) {
-      var st = window.getComputedStyle(n);
-      if (/(auto|scroll)/.test(st.overflowY) && n.scrollHeight > n.clientHeight) {
-        return n;
-      }
-    }
-    return document.scrollingElement || document.documentElement;
-  }
-
-  // Offset from the top of the scrolled content. Unlike a viewport offset it
-  // does not change when the reader scrolls -- only when something above the
-  // element grows or shrinks, which is exactly what the fold does.
-  function contentTop(el, parent) {
-    var r = el.getBoundingClientRect();
-    if (parent === document.scrollingElement || parent === document.documentElement) {
-      return r.top + (window.pageYOffset || parent.scrollTop || 0);
-    }
-    return (r.top - parent.getBoundingClientRect().top) + parent.scrollTop;
-  }
-
-  try {
-    var marker = document.getElementById(KEY)
-              || (document.currentScript && document.currentScript.parentElement);
-    if (!marker) return;
-    var cell = marker.closest('.jp-Cell') || marker.closest('.cell');
-    var out = cell && (cell.querySelector('.jp-Cell-outputWrapper')
-                    || cell.querySelector('.jp-OutputArea'));
-    var parent = scrollParent(marker);
-    if (!cell || !out || !parent) return;
-
-    // One watcher per cell: a re-run retires the previous one.
-    try { if (cell.__sageWatch) cell.__sageWatch.stop(); } catch (e) {}
-
-    var store = (window.__sageTrail = window.__sageTrail || {});
-    var snap = store[KEY] = {
-      parent: parent, cell: cell, out: out,
-      scrollTop: parent.scrollTop, clientHeight: parent.clientHeight,
-      panelTop: null, panelBottom: null,
-      anchor: null, anchorTop: null,
-      frozen: false, t: Date.now()
-    };
-    var installed = Date.now();
-    var pending = false;
-    var stopped = false;
-
-    // A cell the reader can actually see, used as the fixed point: whatever
-    // the fold does to the layout, it moves this cell by exactly the amount
-    // the scroll has to be corrected by.
-    function anchorCell() {
-      var top = parent.scrollTop;
-      var bottom = top + parent.clientHeight;
-      var cells = parent.querySelectorAll('.jp-Cell');
-      for (var i = 0; i < cells.length; i++) {
-        var c = cells[i];
-        if (c === cell) continue;
-        var ct = contentTop(c, parent);
-        if (ct + c.offsetHeight > top + 4 && ct < bottom - 4) return c;
-      }
-      return null;
-    }
-
-    function folded() {
-      // The rewrite's own output, which is the signal to stop recording. It
-      // is found on a cell that windowing has detached too: a removed
-      // subtree still answers querySelector.
-      try { return !!out.querySelector('details.sage-trail-fold'); }
-      catch (e) { return false; }
-    }
-
-    function stop() {
-      if (stopped) return;
-      stopped = true;
-      try { parent.removeEventListener('scroll', schedule); } catch (e) {}
-      try { window.removeEventListener('resize', schedule); } catch (e) {}
-      try { if (ro) ro.disconnect(); } catch (e) {}
-      try { if (mo) mo.disconnect(); } catch (e) {}
-      try { if (cell.__sageWatch && cell.__sageWatch.key === KEY) cell.__sageWatch = null; }
-      catch (e) {}
-    }
-
-    function freeze() { snap.frozen = true; stop(); }
-
-    function measure() {
-      pending = false;
-      if (snap.frozen || stopped) return;
-      // Checked before anything is written, so a frame scheduled before the
-      // rewrite but delivered after it cannot overwrite the last good
-      // reading with a post-fold one.
-      if (folded()) { freeze(); return; }
-      if (Date.now() - installed > 2700000) {
-        try { delete store[KEY]; } catch (e) {}
-        stop();
-        return;
-      }
-      snap.scrollTop = parent.scrollTop;
-      snap.clientHeight = parent.clientHeight;
-      snap.t = Date.now();
-      if (cell.isConnected) {
-        var pt = contentTop(out, parent);
-        snap.panelTop = pt;
-        snap.panelBottom = pt + out.offsetHeight;
-      } else {
-        // Windowing detaches cells that leave the viewport, so this says the
-        // reader is somewhere else -- and where the trail used to be is no
-        // longer evidence of anything.
-        snap.panelTop = null;
-        snap.panelBottom = null;
-      }
-      // Recorded together or not at all: a fresh scrollTop against a stale
-      // anchor is a pair that never existed, and correcting by the
-      // difference would throw the reader somewhere they have never been.
-      var a = anchorCell();
-      snap.anchor = a;
-      snap.anchorTop = a ? contentTop(a, parent) : null;
-    }
-
-    function schedule() {
-      if (pending || snap.frozen || stopped) return;
-      pending = true;
-      try { window.requestAnimationFrame(measure); }
-      catch (e) { pending = false; measure(); }
-    }
-
-    var ro = null, mo = null;
-    parent.addEventListener('scroll', schedule, { passive: true });
-    window.addEventListener('resize', schedule, { passive: true });
-    // The panel grows under the reader as cards arrive, so its extent is
-    // re-read on every change to it, not only when the reader scrolls.
-    try { ro = new ResizeObserver(schedule); ro.observe(out); } catch (e) {}
-    try {
-      mo = new MutationObserver(function () {
-        if (folded()) freeze(); else schedule();
-      });
-      mo.observe(out, { childList: true, subtree: true });
-    } catch (e) {}
-
-    cell.__sageWatch = { key: KEY, stop: stop };
-    measure();
-  } catch (e) { /* the correction falls back to the answer-at-top behaviour */ }
-})();"""
-
-
-def _sage_watch_start() -> None:
-    """Emit the position watcher for this run.
-
-    Its own output, so it is in place before the first card streams, and
-    removed by the rewrite's clear_output along with the cards. Nothing
-    depends on it: with no recording the correction falls back to putting the
-    answer at the top of the screen, which is what it did unconditionally
-    before.
-    """
-    if not _SAGE_TRAIL["on"]:
-        return
-    try:
-        import json as _json
-        import uuid
-        from IPython.display import display, HTML
-        wid = "sage-watch-" + uuid.uuid4().hex[:12]
-        handle = display(
-            HTML(f'<span id="{wid}" style="display:none"></span>'
-                 + "<script>\n"
-                 + _SAGE_WATCH_JS.replace("WATCH_ID", _json.dumps(wid))
-                 + "\n</script>"),
-            display_id=wid,
-        )
-        _SAGE_TRAIL["watch_id"] = wid
-        _SAGE_TRAIL["watch_handle"] = handle
-    except Exception:                                            # noqa: BLE001
-        _SAGE_TRAIL["watch_id"] = None
-        _SAGE_TRAIL["watch_handle"] = None
-
-
-def _sage_watch_erase() -> None:
-    """Replace the watcher's output with nothing.
-
-    The rewrite clears it on the normal path; this is for the paths that
-    never get there. A copy that does survive into a saved file is inert --
-    it only ever records, and the script that acts on a recording is erased
-    too -- but the file is meant to hold no script at all.
-    """
-    handle = _SAGE_TRAIL.get("watch_handle")
-    _SAGE_TRAIL["watch_handle"] = None
-    if handle is None:
-        return
-    try:
-        from IPython.display import HTML
-        handle.update(HTML(""))
-    except Exception:                                            # noqa: BLE001
-        pass
 
 
 def _sage_trail_start() -> None:
     """Begin capturing, discarding anything left over.
 
     A cell can be interrupted and re-run, and an interrupted run never
-    reaches the rewrite that would have cleared its buffer. Resetting here
+    reaches the fold that would have cleared its buffer. Resetting here
     rather than there is what keeps one run's trail out of the next one's.
     """
     _SAGE_TRAIL["on"] = SAGE_FOLD_PROGRESS
@@ -3567,39 +3404,187 @@ def _sage_trail_start() -> None:
     _SAGE_TRAIL["fold_id"] = None
     _SAGE_TRAIL["block"] = None
     _SAGE_TRAIL["block_id"] = None
-    _SAGE_TRAIL["watch_id"] = None
-    _SAGE_TRAIL["watch_handle"] = None
-    _sage_watch_start()
+    _SAGE_TRAIL["live_id"] = None
 
 
 def _sage_trail_cancel() -> None:
-    """Stop capturing and leave what is on screen exactly as it is."""
+    """Stop capturing and leave the whole trail on screen, expanded.
+
+    Reached when the run has gone wrong and the reader is about to go looking
+    for why, so the live view -- which carries only the most recent steps
+    while a cell is healthy -- is expanded to all of them on the way out.
+    """
+    _sage_trail_expand()
     _SAGE_TRAIL["on"] = False
     _SAGE_TRAIL["pre"] = []
     _SAGE_TRAIL["items"] = []
     _SAGE_TRAIL["fold_id"] = None
     _SAGE_TRAIL["block"] = None
     _SAGE_TRAIL["block_id"] = None
-    _SAGE_TRAIL["watch_id"] = None
-    _sage_watch_erase()
+    _SAGE_TRAIL["live_id"] = None
 
 
-def _sage_trail_notice(html: str) -> None:
-    """A warning about the run itself: re-emitted above the fold, not in it."""
-    if _SAGE_TRAIL["on"]:
-        _SAGE_TRAIL["pre"].append(html)
+def _sage_trail_live_html() -> str:
+    """The live view: notices above, then the trail in a fixed-height box.
+
+    Direct children are emitted NEWEST FIRST, which is what both layouts
+    want.
+
+    The default box is `flex-direction: column-reverse`, which lays those
+    children out bottom-up -- so it reads oldest-to-newest down the box, and
+    a reversed flex container holds its initial scroll position at the main
+    start, which here is the bottom, where the newest card is. That is the
+    pin-to-bottom that would otherwise need JavaScript, and every update
+    builds a fresh node, so it re-pins on every card.
+
+    SAGE_TRAIL_LIVE_NEWEST_FIRST drops the flex container for an ordinary
+    block, leaving the newest card at the top where scrollTop 0 already is.
+    It reads backwards, which is worse, but it depends on nothing beyond
+    "a scroll box starts at the top" -- the fallback if a browser disagrees
+    about where a reversed flex container starts scrolled.
+
+    Notices stay OUTSIDE the box: a line whose job is to explain a pause is
+    worth nothing if the reader has to scroll a panel to find it.
+    """
+    items = _SAGE_TRAIL["items"]
+    n = SAGE_TRAIL_LIVE_ITEMS
+    kept = list(items[-n:]) if n and len(items) > n else list(items)
+
+    # Newest first, and stop once the budget is spent. At least one card is
+    # always kept, however big it is: a live view showing nothing at all
+    # would be worse than one over budget.
+    children: list = []
+    if SAGE_TRAIL_LIVE_BYTES:
+        total = 0
+        for frag in reversed(kept):
+            total += len(frag)
+            if children and total > SAGE_TRAIL_LIVE_BYTES:
+                break
+            children.append(frag)
+    else:
+        children = list(reversed(kept))
+
+    hidden = len(items) - len(children)
+    # Last child, which is the TOP of the box in both layouts -- above the
+    # oldest card that is still shown, where the missing ones would be.
+    if hidden > 0:
+        children.append(
+            '<div style="color:#8a8a8a; font-size:0.8em; padding:2px 0 6px 0;'
+            ' font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;">'
+            + ("\u22ef 1 earlier step is not in this window"
+               if hidden == 1 else
+               f"\u22ef {hidden} earlier steps are not in this window")
+            + " \u2014 the fold has the whole trail once the answer is ready."
+            + "</div>"
+        )
+
+    # flex:0 0 auto per child, because a flex item shrinks by default once
+    # the container runs out of room -- which a max-height container with
+    # more content than it can show has, by definition. Without this every
+    # card is squashed instead of the box scrolling.
+    body = "".join(f'<div style="flex:0 0 auto">{c}</div>' for c in children)
+
+    style = (f"max-height:{int(SAGE_TRAIL_LIVE_HEIGHT)}px; overflow-y:auto;"
+             " padding-right:6px; margin:2px 0 10px 0;")
+    if not SAGE_TRAIL_LIVE_NEWEST_FIRST:
+        style += " display:flex; flex-direction:column-reverse;"
+
+    return ("".join(_SAGE_TRAIL["pre"])
+            + f'<div class="sage-trail-live" style="{style}">{body}</div>')
 
 
-def _sage_trail_add(html: str) -> None:
+def _sage_trail_show() -> bool:
+    """Refresh the live view, creating it on first use.
+
+    False means it could not be put on screen at all, and the caller has to
+    display its own fragment the old way.
+    """
+    try:
+        from IPython.display import display, HTML, update_display
+        html = _sage_trail_live_html()
+        if _SAGE_TRAIL["live_id"] is None:
+            import uuid
+            _id = "sage-live-" + uuid.uuid4().hex[:12]
+            display(HTML(html), display_id=_id)
+            _SAGE_TRAIL["live_id"] = _id
+        else:
+            update_display(HTML(html), display_id=_SAGE_TRAIL["live_id"])
+        return True
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _sage_trail_expand() -> None:
+    """Put the whole trail in the live view, in place of the recent steps.
+
+    For the paths where the fold is not going to happen: an error, an
+    interrupt, a fold that could not be built. The live view is the only copy
+    on screen, so a reader left holding the last few steps has lost the rest.
+    """
+    if _SAGE_TRAIL["live_id"] is None:
+        return
+    try:
+        from IPython.display import HTML, update_display
+        update_display(
+            HTML("".join(_SAGE_TRAIL["pre"]) + "".join(_SAGE_TRAIL["items"])),
+            display_id=_SAGE_TRAIL["live_id"],
+        )
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _sage_trail_fallback() -> None:
+    """Give the trail up and hand it back to the callers.
+
+    Only reached if IPython will not take a display id at all. Everything
+    buffered so far goes out as separate outputs, except the newest fragment,
+    which the caller that just failed displays itself. The fold is skipped
+    from here on: one that hid only part of what is on screen would be worse
+    than no fold.
+    """
+    pending = list(_SAGE_TRAIL["pre"]) + list(_SAGE_TRAIL["items"])
+    _SAGE_TRAIL["on"] = False
+    _SAGE_TRAIL["pre"] = []
+    _SAGE_TRAIL["items"] = []
+    _SAGE_TRAIL["live_id"] = None
+    try:
+        from IPython.display import display, HTML
+        for frag in pending[:-1]:
+            display(HTML(frag))
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _sage_trail_notice(html: str) -> bool:
+    """A warning about the run itself: above the fold, not inside it.
+
+    True when the live view has it, and the caller must not display it again.
+    """
+    if not _SAGE_TRAIL["on"]:
+        return False
+    _SAGE_TRAIL["pre"].append(html)
+    if _sage_trail_show():
+        return True
+    _sage_trail_fallback()
+    return False
+
+
+def _sage_trail_add(html: str) -> bool:
     """A card the agent produced while working: goes inside the fold."""
-    if _SAGE_TRAIL["on"]:
-        _SAGE_TRAIL["items"].append(html)
+    if not _SAGE_TRAIL["on"]:
+        return False
+    _SAGE_TRAIL["items"].append(html)
+    if _sage_trail_show():
+        return True
+    _sage_trail_fallback()
+    return False
 
 
-def _sage_trail_add_markdown(text: str) -> None:
+def _sage_trail_add_markdown(text: str) -> bool:
     """The agent's narration between tool calls."""
-    if _SAGE_TRAIL["on"] and text and text.strip():
-        _SAGE_TRAIL["items"].append(_sage_md_to_html(text))
+    if not (_SAGE_TRAIL["on"] and text and text.strip()):
+        return False
+    return _sage_trail_add(_sage_md_to_html(text))
 
 
 def _sage_md_to_html(text: str) -> str:
@@ -3677,9 +3662,8 @@ def _sage_trail_collapse(n_tool_calls: int = 0) -> None:
         return
     try:
         import html as _html
-        from IPython.display import display, HTML, clear_output
-
         import uuid
+
         _fold_id = "sage-fold-" + uuid.uuid4().hex[:12]
         n = int(n_tool_calls)
         # The count is TOOL CALLS -- what "work" means here, and what a reader
@@ -3688,9 +3672,9 @@ def _sage_trail_collapse(n_tool_calls: int = 0) -> None:
         # out at roughly double and matches nothing.
         if n > 0:
             calls = "1 tool call" if n == 1 else f"{n} tool calls"
-            label = f"{calls} — show the agent’s work"
+            label = f"{calls} \u2014 show the agent\u2019s work"
         else:
-            label = "show the agent’s work"
+            label = "show the agent\u2019s work"
 
         block = (
             "".join(_SAGE_TRAIL["pre"])
@@ -3707,238 +3691,39 @@ def _sage_trail_collapse(n_tool_calls: int = 0) -> None:
         _SAGE_TRAIL["block"] = block
         _SAGE_TRAIL["block_id"] = _fold_id
     except Exception:                                            # noqa: BLE001
-        pass
+        # No fold is coming, and the live view holds only the recent steps.
+        # Expand it to the whole trail: it is the only copy on screen.
+        _sage_trail_expand()
     finally:
         _SAGE_TRAIL["pre"] = []
         _SAGE_TRAIL["items"] = []
 
 
 def _sage_trail_emit() -> None:
-    """Put the folded trail on screen, in place of the streamed one.
+    """Replace the live view with the folded trail, in place.
 
-    Called immediately before the first thing that follows it, so the two
-    arrive together. clear_output(wait=True) holds the clear until this
-    block's own display, so the cell never blanks in between. Idempotent:
-    the fold is emitted once however many callers ask for it.
+    No clear_output. The live view is one output held by a display id, so
+    updating it leaves every other output in the cell untouched and keeps the
+    fold exactly where the trail was -- above the answer -- whenever this is
+    called. That is what lets the caller fold LAST, after the answer is on
+    screen, instead of having to fold in the same breath as the thing that
+    follows it. Idempotent: the fold lands once, however many callers ask.
     """
     block = _SAGE_TRAIL.get("block")
     if not block:
         return
     try:
-        from IPython.display import display, HTML, clear_output
-        clear_output(wait=True)
-        display(HTML(block))
+        from IPython.display import display, HTML, update_display
+        if _SAGE_TRAIL.get("live_id"):
+            update_display(HTML(block), display_id=_SAGE_TRAIL["live_id"])
+        else:
+            display(HTML(block))
         _SAGE_TRAIL["fold_id"] = _SAGE_TRAIL.get("block_id")
     except Exception:                                            # noqa: BLE001
         pass
     finally:
         _SAGE_TRAIL["block"] = None
-
-
-# The second script: the correction, run once the answer is on screen.
-#
-# Replacing dozens of outputs with one makes the document much shorter under
-# the reader. What that means depends on where the reader is -- following the
-# trail, or reading something else while the agent works -- so the watcher's
-# recording is consulted first. See sageDecide.
-_SAGE_SCROLL_JS = r"""// --- sageDecide (unit-tested on its own; keep it pure) ---
-// snap: what the watcher recorded just before the trail folded, in content
-//       coordinates -- scrollTop/clientHeight for the viewport, panelTop/
-//       panelBottom for the trail, anchorTop for a cell the reader could see.
-// now:  the same anchor cell's offset after the fold, or null if it is gone.
-function sageDecide(snap, now) {
-  if (!snap || !snap.clientHeight) return { mode: 'answer', scrollTop: null };
-  var viewTop = snap.scrollTop;
-  var viewBottom = snap.scrollTop + snap.clientHeight;
-  if (typeof snap.panelTop === 'number' && typeof snap.panelBottom === 'number'
-      && snap.panelBottom > snap.panelTop) {
-    var past = snap.panelBottom - viewTop;    // trail reaches past the top edge
-    var before = viewBottom - snap.panelTop;  // trail starts before the bottom edge
-    if (past > 0 && before > 0) {
-      var overlap = Math.min(past, before,
-                             snap.panelBottom - snap.panelTop, snap.clientHeight);
-      // A sliver of the trail at the far edge of the screen is not reading
-      // it. Enough of it to be what you are looking at is.
-      if (overlap >= Math.max(40, snap.clientHeight * 0.1)) {
-        return { mode: 'answer', scrollTop: null };
-      }
-    }
-  }
-  // Reading somewhere else: hold that still instead. Above the trail nothing
-  // above the reader changed, the shift comes out zero and this does nothing;
-  // below it the trail lost height and everything moved up by that much,
-  // which is the shift the anchor measures. One rule covers both.
-  if (now && typeof now.anchorTop === 'number' && typeof snap.anchorTop === 'number') {
-    return { mode: 'hold',
-             scrollTop: Math.max(0, snap.scrollTop + (now.anchorTop - snap.anchorTop)) };
-  }
-  return { mode: 'none', scrollTop: null };
-}
-// --- end sageDecide ---
-
-(function () {
-  var tries = 0;
-  var stopped = false;
-  var userMoved = false;
-  var snap = null;
-  try { snap = (window.__sageTrail || {})[WATCH_ID] || null; } catch (e) {}
-
-  function scrollParent(el) {
-    var outer = el.closest ? el.closest('.jp-WindowedPanel-outer') : null;
-    if (outer) return outer;
-    for (var n = el.parentElement; n; n = n.parentElement) {
-      var st = window.getComputedStyle(n);
-      if (/(auto|scroll)/.test(st.overflowY) && n.scrollHeight > n.clientHeight) {
-        return n;
-      }
-    }
-    return document.scrollingElement || document.documentElement;
-  }
-
-  function contentTop(el, parent) {
-    var r = el.getBoundingClientRect();
-    if (parent === document.scrollingElement || parent === document.documentElement) {
-      return r.top + (window.pageYOffset || parent.scrollTop || 0);
-    }
-    return (r.top - parent.getBoundingClientRect().top) + parent.scrollTop;
-  }
-
-  function bringToTop(target) {
-    try {
-      var sc = scrollParent(target);
-      if (!sc) return;
-      var ref = (sc === document.scrollingElement || sc === document.documentElement)
-        ? 0 : sc.getBoundingClientRect().top;
-      sc.scrollTop += (target.getBoundingClientRect().top - ref) - 8;
-    } catch (e) { /* leave the scroll where the reader put it */ }
-  }
-
-  // Where the anchor cell sits now. Null once it is gone -- windowing
-  // detaches cells that leave the viewport -- and then nothing is corrected.
-  function nowOffset() {
-    try {
-      if (!snap || !snap.anchor || !snap.parent) return null;
-      if (!snap.anchor.isConnected || !snap.parent.isConnected) return null;
-      return { anchorTop: contentTop(snap.anchor, snap.parent) };
-    } catch (e) { return null; }
-  }
-
-  function cleanup() {
-    try { delete window.__sageTrail[WATCH_ID]; } catch (e) {}
-  }
-
-  // The reader taking hold of the scroll outranks any correction. Watching
-  // for the input and not for the movement is deliberate: the correction
-  // scrolls too, and must not mistake itself for a reader.
-  function noteUser() { userMoved = true; }
-  try {
-    ['wheel', 'touchstart', 'keydown', 'pointerdown'].forEach(function (ev) {
-      window.addEventListener(ev, noteUser, { passive: true, capture: true, once: true });
-    });
-  } catch (e) {}
-
-  function hold() {
-    if (stopped || userMoved) return;
-    var d = sageDecide(snap, nowOffset());
-    if (d.mode !== 'hold' || d.scrollTop === null) { stopped = true; return; }
-    try {
-      if (Math.abs(snap.parent.scrollTop - d.scrollTop) > 2) {
-        snap.parent.scrollTop = d.scrollTop;
-      }
-    } catch (e) { stopped = true; }
-  }
-
-  function answer() {
-    var fold = document.getElementById(FOLD_ID);
-    if (!fold) {
-      // Scripts are evaluated as the output renders, which can be before the
-      // node is in the document.
-      if (++tries < 20) setTimeout(answer, 100);
-      return;
-    }
-    // The whole first output: any pre-run notice, then the fold line, then
-    // the answer immediately under it.
-    var target = fold.closest('.jp-OutputArea-child')
-              || fold.closest('.output_area') || fold;
-    bringToTop(target);
-    // Charts in the answer finish loading after this and shift what is below
-    // them, so the correction is repeated as the layout settles.
-    setTimeout(function () { if (!userMoved) bringToTop(target); }, 250);
-    setTimeout(function () { if (!userMoved) bringToTop(target); }, 1000);
-  }
-
-  function go() {
-    // Belt and braces: this script is normally erased before the notebook is
-    // saved, but a copy that survived must not scroll a reader who is only
-    // reopening the file. One correction per fold per browser session.
-    try {
-      var k = 'sageScrolled:' + FOLD_ID;
-      if (window.sessionStorage.getItem(k)) return;
-      window.sessionStorage.setItem(k, '1');
-    } catch (e) { /* private window, blocked storage: correct it anyway */ }
-
-    var decision = sageDecide(snap, nowOffset());
-    if (decision.mode === 'answer') {
-      answer();
-    } else if (decision.mode === 'hold') {
-      // Repeated as the answer renders under the fold and settles, each pass
-      // measured afresh against the same recording.
-      hold();
-      setTimeout(hold, 250);
-      setTimeout(hold, 1000);
-    }
-    setTimeout(cleanup, 1500);
-  }
-
-  go();
-})();"""
-
-
-def _sage_scroll_to_answer() -> None:
-    """Put the reader back where they were after the rewrite.
-
-    Replacing dozens of outputs with one makes the document much shorter
-    while the scroll position stays where it was, so the viewport lands in
-    blank space past the end of the notebook. Only the browser can put that
-    right.
-
-    Where "right" is depends on what the reader was doing, which is why the
-    watcher records it. Following the trail: the top of the answer, with the
-    fold line above it. Reading something else while the agent worked: that,
-    still where they left it -- which above the trail means not moving at
-    all, and below it means up by exactly the height the trail gave back.
-    See sageDecide.
-
-    It only ever needs putting right on a LIVE run. A reopened notebook
-    renders at its collapsed height from the start and nothing moves -- so
-    this script is displayed through a handle and then replaced, through the
-    same handle, with nothing. It runs once, as it renders; the saved .ipynb
-    keeps the empty version. Reopening neither runs it nor scrolls, and the
-    file still contains no script, which is the whole point of the fold.
-    """
-    if not SAGE_FOLD_PROGRESS or not _SAGE_TRAIL.get("fold_id"):
-        return
-    try:
-        import json as _json
-        from IPython.display import display, HTML
-        fold_id = _SAGE_TRAIL["fold_id"]
-        handle = display(
-            HTML("<script>\n"
-                 + _SAGE_SCROLL_JS
-                   .replace("FOLD_ID", _json.dumps(fold_id))
-                   .replace("WATCH_ID",
-                            _json.dumps(_SAGE_TRAIL.get("watch_id") or ""))
-                 + "\n</script>"),
-            display_id="scroll-" + fold_id,
-        )
-        if handle is not None:
-            import time as _time_mod
-            _time_mod.sleep(SAGE_SCROLL_ERASE_DELAY)
-            handle.update(HTML(""))
-    except Exception:                                            # noqa: BLE001
-        pass
-
-
+        _SAGE_TRAIL["live_id"] = None
 
 
 # ---------------------------------------------------------------------------
@@ -4974,10 +4759,10 @@ try:
             print("Usage: %ask <prompt>  or  %%ask in a cell")
             return
 
-        # From here on, everything this cell displays is captured as well as
-        # shown, so the trail can be rewritten as one collapsed block once the
+        # From here on the cell's progress is buffered and shown through one
+        # output, so it can be replaced by a single collapsed block once the
         # answer is ready. Started before the pre-run warnings, which the
-        # rewrite puts back above the fold.
+        # fold keeps above the control rather than inside it.
         _sage_trail_start()
 
         # Text-only guard, appended to the END of every request. A system-prompt
@@ -5725,8 +5510,8 @@ try:
                     f"the registry."
                     f"</div>"
                 )
-                _sage_trail_notice(_mcp_html)
-                display(HTML(_mcp_html))
+                if not _sage_trail_notice(_mcp_html):
+                    display(HTML(_mcp_html))
 
         _t_start = _time.time()
         _loop = asyncio.get_event_loop()
@@ -5745,12 +5530,12 @@ try:
                 _run_agent_async(prompt, system_prompt_text, review=review)
             )
         except KeyboardInterrupt:
-            # Stopped on purpose. The trail stays open and complete, which is
-            # what the reader wants to look at; only the watcher's own
-            # (invisible) output is taken back, so the saved file keeps no
-            # script.
+            # Stopped on purpose, and the reader is about to go looking for
+            # how far it got. The live view carries only what fits the box, so
+            # it is expanded to the whole trail on the way out -- it is the
+            # only copy on screen, and no fold is coming to hold the rest.
             _loop.set_exception_handler(_orig_exc_handler)
-            _sage_watch_erase()
+            _sage_trail_cancel()
             raise
         except Exception as _err:
             _loop.set_exception_handler(_orig_exc_handler)
@@ -5786,9 +5571,9 @@ try:
             ))
             return
         _loop.set_exception_handler(_orig_exc_handler)
-        # Built here, while the streamed trail is still all the cell holds and
-        # the counts are to hand. It goes on screen at _sage_trail_emit, with
-        # whatever comes next.
+        # Built here, while the buffer is still intact and the counts are to
+        # hand. It does not reach the screen until _sage_trail_emit, which is
+        # the last thing this cell does.
         try:
             _sage_trail_collapse(sum(tool_counts.values()))
         except Exception:                                        # noqa: BLE001
@@ -5820,8 +5605,9 @@ try:
         except Exception:
             pass
         if _pending:
-            # A widget belongs under the fold, so the fold goes first.
-            _sage_trail_emit()
+            # No fold ordering to respect: the live view is one output holding
+            # its own position, so a widget displayed now lands below it
+            # whether the fold has happened or not.
             from IPython.display import display as _disp
             for _entry in _pending:
                 # Each entry is (object, kwargs) — see _capture_display in
@@ -5880,10 +5666,6 @@ try:
                 _reg[cell_id] = _trackable
                 _save_cell_registry(_reg)
 
-        # The fold and the answer in one go, which is the whole point of
-        # having built the fold earlier and held it.
-        _sage_trail_emit()
-
         # Render the final report — file references become maps/images inline
         found_any, map_rendered = _render_markdown_with_files(final_text)
 
@@ -5919,10 +5701,16 @@ try:
             except Exception as _disp_err:
                 print(f"[review display failed: {type(_disp_err).__name__}: {_disp_err}]")
 
-        # Last thing the cell emits, once the answer and the verdict are both
-        # laid out: the rewrite above shortened the document under the reader.
+        # The fold goes LAST, once the answer, its maps and the verdict are
+        # all on screen. It holds its own place -- the live view's output,
+        # above the answer -- so folding here changes nothing about WHERE it
+        # lands, only when. And when is the point: the cell has already grown
+        # by the answer before it shrinks by the trail, so the document never
+        # ends up shorter than the reader's scroll position and that position
+        # survives. Folding before the answer was rendered is what used to
+        # send the reader to the blank region past the last cell.
         try:
-            _sage_scroll_to_answer()
+            _sage_trail_emit()
         except Exception:                                        # noqa: BLE001
             pass
 

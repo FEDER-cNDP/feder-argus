@@ -75,24 +75,33 @@ check "MATH RULE in the prompt"        "1"  "grep -c 'MATH RULE' $MAGIC"
 # keeps no record of this file, so a script in saved output never runs and a
 # JavaScript fold would be there the day it ran and gone the day it reopened.
 # Folded for real here and the result inspected, rather than grepped for.
-check "trail folds with no script"    "1"  "ipython -c \"import IPython.display as d;o=[];d.display=lambda *a,**k:o.append(getattr(a[0],'data',''));d.clear_output=lambda wait=False:None;_sage_trail_start();_display_tool_call('read_file',{'file_path':'/x'});_sage_trail_collapse(1);_sage_trail_emit();f=[str(x) for x in o if 'sage-fold-' in str(x)];print('TRAIL',1 if (len(f)==1 and '<script' not in f[0] and 'read_file' in f[0] and 'summary' in f[0]) else 0)\" 2>/dev/null | sed -n 's/^TRAIL //p'"
+#
+# 60 cards, because the number is the point. JupyterLab renders at most
+# maxNumberOutputs of them -- 50 -- and hides the rest behind a "Show More
+# Outputs" button whose click used to grow the cell by thousands of pixels
+# and send the reader past the last cell when the trail folded. So the trail
+# is ONE output, updated in place: asserted here as one display() and 59
+# updates to that same id, with the fold as the 60th.
+check "trail folds with no script"         "1"  "ipython -c \"import IPython.display as d;o=[];u=[];d.display=lambda *a,**k:o.append((k.get('display_id'),getattr(a[0],'data','') if a else ''));d.update_display=lambda obj,**k:u.append((k.get('display_id'),getattr(obj,'data','')));d.clear_output=lambda wait=False:o.append(('CLEAR',''));_sage_trail_start();[_display_tool_call('read_file',{'file_path':'/x'+str(i)}) for i in range(60)];_sage_trail_collapse(60);_sage_trail_emit();f=u[-1][1] if u else '';print('TRAIL',1 if (len(o)==1 and o[0][0] and len(u)==60 and all(x[0]==o[0][0] for x in u) and 'sage-fold-' in f and '<script' not in f and '/x0' in f and '/x59' in f and f.index('/x0')<f.index('/x59')) else 0)\" 2>/dev/null | sed -n 's/^TRAIL //p'"
 # The agent stopping and the answer being ready are seconds apart -- a
 # notebook to sign, a widget to flush -- and for those seconds the cell used
 # to show a folded trail and no answer. The fold is built when the agent
 # stops and shown when the answer is ready, so building it must emit nothing.
-check "fold waits for the answer"    "1"  "ipython -c \"import IPython.display as d;o=[];c=[];d.display=lambda *a,**k:o.append(getattr(a[0],'data','') if a else '');d.clear_output=lambda wait=False:c.append(wait);_sage_trail_start();_display_tool_call('read_file',{'file_path':'/x'});_sage_trail_collapse(1);built=(not c and not [x for x in o if 'sage-fold-' in str(x)] and bool(_SAGE_TRAIL['block']));_sage_trail_emit();_sage_trail_emit();shown=(c==[True] and len([x for x in o if 'sage-fold-' in str(x)])==1);print('WAIT',1 if (built and shown) else 0)\" 2>/dev/null | sed -n 's/^WAIT //p'"
+# And nothing on the path may call clear_output: tearing the output area down
+# is what shortened the document under the reader.
+check "fold waits for the answer"          "1"  "ipython -c \"import IPython.display as d;o=[];u=[];d.display=lambda *a,**k:o.append(getattr(a[0],'data','') if a else '');d.update_display=lambda obj,**k:u.append(getattr(obj,'data',''));d.clear_output=lambda wait=False:o.append('CLEAR');_sage_trail_start();[_display_tool_call('read_file',{'file_path':'/x'+str(i)}) for i in range(60)];built=(len(u)==59);_sage_trail_collapse(60);silent=(built and len(u)==59 and bool(_SAGE_TRAIL['block']));_sage_trail_emit();_sage_trail_emit();print('WAIT',1 if (silent and len(u)==60 and 'CLEAR' not in o and 'max-height' not in u[-1]) else 0)\" 2>/dev/null | sed -n 's/^WAIT //p'"
+# What keeps the reader's scroll position: the live view is a box of fixed
+# height holding the whole trail, so the cell is the same size at card 5 and
+# card 160 and the fold has almost no height to take away. column-reverse is
+# how it stays pinned to the newest card without JavaScript -- cards go out
+# newest-first and are laid back out oldest-first -- and flex:0 0 auto per
+# card is what makes the box scroll instead of squashing them.
+check "live view is a bounded box"         "1"  "ipython -c \"import IPython.display as d;o=[];u=[];d.display=lambda *a,**k:o.append(getattr(a[0],'data','') if a else '');d.update_display=lambda obj,**k:u.append(getattr(obj,'data',''));d.clear_output=lambda wait=False:o.append('CLEAR');_sage_trail_start();[_display_tool_call('read_file',{'file_path':'/x'+str(i)}) for i in range(60)];live=u[-1];print('BOX',1 if (len(o)==1 and 'max-height:'+str(SAGE_TRAIL_LIVE_HEIGHT)+'px' in live and 'overflow-y:auto' in live and 'column-reverse' in live and live.count('flex:0 0 auto')==60 and live.index('/x59')<live.index('/x0')) else 0)\" 2>/dev/null | sed -n 's/^BOX //p'"
+# A run that fails or is interrupted never reaches the fold, and the live
+# view is the only copy on screen. It is expanded to the whole trail on the
+# way out, because that is what a reader hunting for the failure needs.
+check "an error expands the trail"         "1"  "ipython -c \"import IPython.display as d;u=[];d.display=lambda *a,**k:None;d.update_display=lambda obj,**k:u.append(getattr(obj,'data',''));d.clear_output=lambda wait=False:None;_sage_trail_start();[_display_tool_call('read_file',{'file_path':'/x'+str(i)}) for i in range(60)];_sage_trail_cancel();print('EXPAND',1 if (u and 'max-height' not in u[-1] and '/x0' in u[-1] and '/x59' in u[-1]) else 0)\" 2>/dev/null | sed -n 's/^EXPAND //p'"
 check "markdown-it (fold narration)" "1"  "python -c 'import markdown_it' >/dev/null 2>&1 && echo 1 || echo 0"
-# Two scripts are left, and neither may reach the saved file. One records
-# where the reader is looking while the trail streams; the rewrite's
-# clear_output takes it with the cards. The other corrects the scroll
-# afterwards, consults that recording, and erases itself through its own
-# display handle. Asserted: both emitted, the correction keyed to the
-# recording, and the correction replaced by nothing.
-check "scroll script erases itself"  "1"  "ipython -c \"import IPython.display as d,types;o=[];u=[];d.display=(lambda *a,**k:(o.append(getattr(a[0],'data','') if a else ''),types.SimpleNamespace(update=lambda obj,**kw:u.append(getattr(obj,'data',''))) if k.get('display_id') else None)[1]);d.clear_output=lambda wait=False:None;_sage_trail_start();w=_SAGE_TRAIL['watch_id'];_display_tool_call('read_file',{'file_path':'/x'});_sage_trail_collapse(1);_sage_trail_emit();_sage_scroll_to_answer();s=[str(x) for x in o if '<script' in str(x)];print('SCROLL',1 if (len(s)==2 and w and w in s[0] and w in s[1] and u==['']) else 0)\" 2>/dev/null | sed -n 's/^SCROLL //p'"
-# A run that fails keeps its trail open on screen -- but the recorder is not
-# the reader's output, and nothing clears it on that path, so it is taken
-# back by hand or it ends up in the saved file.
-check "watcher taken back on error"  "1"  "ipython -c \"import IPython.display as d,types;u=[];d.display=(lambda *a,**k:types.SimpleNamespace(update=lambda obj,**kw:u.append(getattr(obj,'data',''))) if k.get('display_id') else None);d.clear_output=lambda wait=False:None;_sage_trail_start();_display_tool_call('read_file',{'file_path':'/x'});_sage_trail_cancel();print('WATCH',1 if u==[''] else 0)\" 2>/dev/null | sed -n 's/^WATCH //p'"
 # %model is how Greg and Amy pick the LLM without a terminal. Its cache clear
 # is not cosmetic: without it the config changes and the kernel keeps serving
 # the previous model, silently and with a perfectly good answer.
